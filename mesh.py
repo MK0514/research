@@ -660,19 +660,18 @@ def save_mesh(
     )
     print(f"[Save] {path}.npz")
 
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Structured axisymmetric rocket mesh generator")
     p.add_argument("--profile", required=True, help="Rocket profile CSV with columns x_m, r_m")
-    p.add_argument("--nj_body", type=int, default=700, help="Axial body points after weighted resampling")
-    p.add_argument("--ni_body", type=int, default=56, help="Inner dense-band radial layers")
-    p.add_argument("--ni_outer", type=int, default=32, help="Outer radial layers after dense band")
-    p.add_argument("--first_cell", type=float, default=5.0e-5, help="First normal cell height [m]")
-    p.add_argument("--growth_inner", type=float, default=1.12, help="Inner dense-band growth ratio")
-    p.add_argument("--growth_outer", type=float, default=1.18, help="Outer growth ratio")
-    p.add_argument("--dense_band_thickness", type=float, default=0.08, help="Minimum near-body dense envelope thickness [m]")
+    p.add_argument("--nj_body", type=int, default=1200, help="Axial body points after weighted resampling")
+    p.add_argument("--ni_body", type=int, default=96, help="Inner dense-band radial layers")
+    p.add_argument("--ni_outer", type=int, default=56, help="Outer radial layers after dense band")
+    p.add_argument("--first_cell", type=float, default=3.0e-5, help="First normal cell height [m]")
+    p.add_argument("--growth_inner", type=float, default=1.07, help="Inner dense-band growth ratio")
+    p.add_argument("--growth_outer", type=float, default=1.14, help="Outer growth ratio")
+    p.add_argument("--dense_band_thickness", type=float, default=0.14, help="Minimum near-body dense envelope thickness [m]")
     p.add_argument("--wake_length", type=float, default=1.00, help="Structured wake/base connector length [m]")
-    p.add_argument("--wake_nx", type=int, default=42, help="Axial columns in wake/base connector")
+    p.add_argument("--wake_nx", type=int, default=72, help="Axial columns in wake/base connector")
     p.add_argument("--curvature_weight", type=float, default=4.0, help="Curvature weight for body resampling")
     p.add_argument("--slope_weight", type=float, default=2.5, help="Slope-change weight for body resampling")
     p.add_argument("--r_far", type=float, default=None, help="Far-field radius [m], default 20*R_max")
@@ -683,7 +682,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--interface_blend_cols", type=int, default=10, help="Columns blended to vertical at the nose interface")
     p.add_argument("--output", default=None, help="Output prefix")
     return p.parse_args()
-
 
 def main() -> None:
     args = parse_args()
