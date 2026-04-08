@@ -1,28 +1,3 @@
-"""
-mesh.py
-=======
-Structured multi-block mesh generator for 2D axisymmetric rocket CFD.
-
-The original v4 code solved negative cells by forcing Block2 endpoint normals
-to be purely radial over a very large span. That fixed folding, but it also:
-  1. weakened body-surface tracking near nose/shoulder/aft,
-  2. left the base/wake region under-resolved or partially empty,
-  3. kept the inflation region too shallow,
-  4. transitioned to coarse far-field too quickly around the full body.
-
-This revision keeps the original "body-fitted Block2 + Cartesian TFI outer
-blocks" philosophy, but adds three targeted upgrades instead of replacing the
-whole code:
-  - curvature + slope weighted axial resampling on the body surface,
-  - two-stage radial layering (deep dense band + outer growth),
-  - a local structured wake/base block so the trailing-edge/base region is
-    physically filled without turning the wake strip into a fake wall.
-
-Output:
-  <prefix>.npz       mesh arrays and metadata
-  <prefix>_mesh.png  5-panel visualization
-"""
-
 import argparse
 import csv
 import os
