@@ -1,0 +1,443 @@
+import argparse
+import os
+from pathlib import Path
+
+import gmsh
+import numpy as np
+import pandas as pd
+
+
+# ----------------------- defaults -----------------------
+DEFAULT_INPUT_CSV = "Falcon9_profile.csv"
+DEFAULT_OUTPUT_MSH = "rocket_mesh.msh"
+DEFAULT_OUTPUT_PNG = "mesh_visualization.png"
+
+DOMAIN_FACTOR = 25.0
+HWALL_FRAC = 0.01
+BL_RATIO = 1.2
+BL_THICK_FRAC = 0.2
+LC_FAR = None
+GROW_DIST_FRAC = 5.0
+USE_QUAD_BL = True
+AUTO_SCALE_MM_THRESHOLD = 100.0
+RADIUS_TOL = 1.0e-9
+BL_END_TRIM_FRAC = 0.03
+BL_END_TRIM_MIN = 8
+# -------------------------------------------------------
+
+
+def resolve_csv_path(csv_path: str) -> Path:
+    candidate = Path(csv_path).expanduser()
+    if candidate.is_file():
+        return candidate.resolve()
+
+    script_dir = Path(__file__).resolve().parent
+    script_relative = (script_dir / candidate).resolve()
+    if script_relative.is_file():
+        return script_relative
+
+    cwd_relative = (Path.cwd() / candidate).resolve()
+    if cwd_relative.is_file():
+        return cwd_relative
+
+    raise FileNotFoundError(
+        f"CSV file not found: '{csv_path}'. "
+        f"Checked '{candidate}', '{script_relative}', and '{cwd_relative}'."
+    )
+
+
+def load_profile(csv_path: Path) -> tuple[float, float, np.ndarray, np.ndarray]:
+    df = pd.read_csv(csv_path)
+    df.columns = df.columns.str.strip().str.lower()
+
+    x_candidates = ("x", "x_m")
+    r_candidates = ("r", "r_m")
+    x = next((df[col].to_numpy() for col in x_candidates if col in df.columns), df.iloc[:, 0].to_numpy())
+    r = next((df[col].to_numpy() for col in r_candidates if col in df.columns), df.iloc[:, 1].to_numpy())
+
+    valid = np.isfinite(x) & np.isfinite(r)
+    x = x[valid].astype(float, copy=False)
+    r = r[valid].astype(float, copy=False)
+
+    if x.size < 3:
+        raise ValueError("At least 3 valid profile points are required.")
+
+    order = np.argsort(x, kind="stable")
+    x = x[order]
+    r = r[order]
+
+    if np.nanmax(np.abs(r)) > AUTO_SCALE_MM_THRESHOLD:
+        x *= 0.001
+        r *= 0.001
+
+    keep = np.ones_like(x, dtype=bool)
+    keep[1:] = np.diff(x) > 1e-12
+    x = x[keep]
+    r = r[keep]
+
+    if x.size < 3:
+        raise ValueError("Profile has too many duplicate x values after cleanup.")
+    if np.any(r < 0):
+        raise ValueError("Radius values must be non-negative for axisymmetric meshing.")
+
+    nose_x = float(np.min(x))
+    base_x = float(np.max(x))
+
+    wall_mask = r > RADIUS_TOL
+    if np.count_nonzero(wall_mask) < 2:
+        raise ValueError("Profile must contain at least two off-axis wall points.")
+
+    wall_indices = np.flatnonzero(wall_mask)
+    start = int(wall_indices[0])
+    end = int(wall_indices[-1]) + 1
+    wall_x = x[start:end]
+    wall_r = r[start:end]
+
+    keep = np.ones_like(wall_x, dtype=bool)
+    keep[1:] = np.diff(wall_x) > 1e-12
+    wall_x = wall_x[keep]
+    wall_r = wall_r[keep]
+
+    if wall_x.size < 2:
+        raise ValueError("Wall profile collapsed after removing axis endpoints and duplicate x values.")
+
+    return nose_x, base_x, wall_x, wall_r
+
+
+def triangulate_surface_elements(node_tags: np.ndarray, elem_types, elem_node_tags) -> np.ndarray:
+    tag_to_index = {int(tag): idx for idx, tag in enumerate(node_tags)}
+    triangles = []
+
+    for elem_type, raw_nodes in zip(elem_types, elem_node_tags):
+        name, _, _, num_nodes, _, _ = gmsh.model.mesh.getElementProperties(elem_type)
+        kind = name.lower()
+
+        connectivity = np.asarray(raw_nodes, dtype=int).reshape(-1, num_nodes)
+        if connectivity.size == 0:
+            continue
+
+        if num_nodes >= 3 and kind.startswith("triangle"):
+            triangles.append(connectivity[:, :3])
+            continue
+
+        if num_nodes >= 4 and (kind.startswith("quadrangle") or kind.startswith("quadrilateral")):
+            first_four = connectivity[:, :4]
+            triangles.append(first_four[:, [0, 1, 2]])
+            triangles.append(first_four[:, [0, 2, 3]])
+
+    if not triangles:
+        raise RuntimeError(
+            "No surface triangles/quads were extracted from the 2D mesh. "
+            "Check Gmsh warnings for curve-loop or boundary-layer failures."
+        )
+
+    tri_tags = np.vstack(triangles)
+    tri_idx = np.empty_like(tri_tags)
+    for i in range(tri_tags.shape[0]):
+        for j in range(tri_tags.shape[1]):
+            tag = int(tri_tags[i, j])
+            if tag not in tag_to_index:
+                raise KeyError(f"Element references unknown node tag {tag}.")
+            tri_idx[i, j] = tag_to_index[tag]
+    return tri_idx
+
+
+def extract_plot_elements(
+    node_tags: np.ndarray, elem_types, elem_node_tags
+) -> tuple[np.ndarray, np.ndarray]:
+    tag_to_index = {int(tag): idx for idx, tag in enumerate(node_tags)}
+    triangles = []
+    quads = []
+
+    for elem_type, raw_nodes in zip(elem_types, elem_node_tags):
+        name, _, _, num_nodes, _, _ = gmsh.model.mesh.getElementProperties(elem_type)
+        kind = name.lower()
+        connectivity = np.asarray(raw_nodes, dtype=int).reshape(-1, num_nodes)
+        if connectivity.size == 0:
+            continue
+
+        if num_nodes >= 3 and kind.startswith("triangle"):
+            tri_tags = connectivity[:, :3]
+            tri_idx = np.empty_like(tri_tags)
+            for i in range(tri_tags.shape[0]):
+                for j in range(3):
+                    tri_idx[i, j] = tag_to_index[int(tri_tags[i, j])]
+            triangles.append(tri_idx)
+            continue
+
+        if num_nodes >= 4 and (kind.startswith("quadrangle") or kind.startswith("quadrilateral")):
+            quad_tags = connectivity[:, :4]
+            quad_idx = np.empty_like(quad_tags)
+            for i in range(quad_tags.shape[0]):
+                for j in range(4):
+                    quad_idx[i, j] = tag_to_index[int(quad_tags[i, j])]
+            quads.append(quad_idx)
+
+    tri_idx = np.vstack(triangles) if triangles else np.empty((0, 3), dtype=int)
+    quad_idx = np.vstack(quads) if quads else np.empty((0, 4), dtype=int)
+    return tri_idx, quad_idx
+
+
+def select_boundary_layer_curves(wall_curves: list[int]) -> list[int]:
+    if len(wall_curves) < 2 * BL_END_TRIM_MIN + 3:
+        return wall_curves
+    trim = max(BL_END_TRIM_MIN, int(len(wall_curves) * BL_END_TRIM_FRAC))
+    if 2 * trim >= len(wall_curves) - 2:
+        return wall_curves
+    return wall_curves[trim:-trim]
+
+
+def generate_mesh_with_gmsh(
+    x_coords: np.ndarray,
+    r_coords: np.ndarray,
+    nose_x: float,
+    base_x: float,
+    output_msh: Path,
+    use_boundary_layer: bool,
+):
+    L = float(x_coords.max() - x_coords.min())
+    R_max = float(r_coords.max())
+    domain_radius = DOMAIN_FACTOR * L
+    hwall = HWALL_FRAC * R_max
+    lc_far = LC_FAR if LC_FAR is not None else 0.1 * L
+
+    gmsh.initialize()
+    gmsh.option.setNumber("General.Terminal", 1)
+    gmsh.option.setNumber("Mesh.Algorithm", 6)
+    gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
+    gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
+    gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
+    gmsh.option.setNumber("Mesh.RecombineAll", 0)
+    gmsh.model.add("Rocket_Mesh")
+
+    try:
+        geo = gmsh.model.geo
+
+        rocket_pts = [geo.addPoint(float(x), float(r), 0.0, lc_far) for x, r in zip(x_coords, r_coords)]
+        pt_nose_axis = geo.addPoint(nose_x, 0.0, 0.0, hwall)
+        pt_ff_left = geo.addPoint(nose_x - domain_radius, 0.0, 0.0, lc_far)
+        pt_ff_tl = geo.addPoint(nose_x - domain_radius, domain_radius, 0.0, lc_far)
+        pt_ff_tr = geo.addPoint(base_x + domain_radius, domain_radius, 0.0, lc_far)
+        pt_ff_right = geo.addPoint(base_x + domain_radius, 0.0, 0.0, lc_far)
+        pt_base_axis = geo.addPoint(base_x, 0.0, 0.0, hwall)
+
+        wall_curves = [geo.addLine(p1, p2) for p1, p2 in zip(rocket_pts[:-1], rocket_pts[1:])]
+        l_axis_front = geo.addLine(pt_ff_left, pt_nose_axis)
+        l_nose_close = geo.addLine(pt_nose_axis, rocket_pts[0])
+        l_base_close = geo.addLine(rocket_pts[-1], pt_base_axis)
+        l_axis_back = geo.addLine(pt_base_axis, pt_ff_right)
+        l_ff_right = geo.addLine(pt_ff_right, pt_ff_tr)
+        l_ff_top = geo.addLine(pt_ff_tr, pt_ff_tl)
+        l_ff_left = geo.addLine(pt_ff_tl, pt_ff_left)
+
+        loop = geo.addCurveLoop(
+            [
+                l_axis_front,
+                l_nose_close,
+                *wall_curves,
+                l_base_close,
+                l_axis_back,
+                l_ff_right,
+                l_ff_top,
+                l_ff_left,
+            ]
+        )
+        surface = geo.addPlaneSurface([loop])
+        geo.synchronize()
+
+        gmsh.model.mesh.field.add("Distance", 1)
+        gmsh.model.mesh.field.setNumbers(1, "CurvesList", wall_curves)
+        gmsh.model.mesh.field.setNumber(1, "Sampling", 300)
+
+        gmsh.model.mesh.field.add("Threshold", 2)
+        gmsh.model.mesh.field.setNumber(2, "InField", 1)
+        gmsh.model.mesh.field.setNumber(2, "SizeMin", 5.0 * hwall)
+        gmsh.model.mesh.field.setNumber(2, "SizeMax", lc_far)
+        gmsh.model.mesh.field.setNumber(2, "DistMin", 0.5 * R_max)
+        gmsh.model.mesh.field.setNumber(2, "DistMax", GROW_DIST_FRAC * R_max)
+
+        bl_curves = select_boundary_layer_curves(wall_curves)
+
+        if use_boundary_layer and bl_curves:
+            gmsh.model.mesh.field.add("BoundaryLayer", 3)
+            gmsh.model.mesh.field.setNumbers(3, "CurvesList", bl_curves)
+            gmsh.model.mesh.field.setNumber(3, "Size", hwall)
+            gmsh.model.mesh.field.setNumber(3, "Ratio", BL_RATIO)
+            gmsh.model.mesh.field.setNumber(3, "Thickness", BL_THICK_FRAC * R_max)
+            gmsh.model.mesh.field.setNumber(3, "Quads", 1 if USE_QUAD_BL else 0)
+            gmsh.model.mesh.field.setNumbers(3, "PointsList", [rocket_pts[0], rocket_pts[-1]])
+            gmsh.model.mesh.field.setAsBoundaryLayer(3)
+
+        gmsh.model.mesh.field.setAsBackgroundMesh(2)
+
+        gmsh.model.addPhysicalGroup(1, [l_nose_close, *wall_curves, l_base_close], name="wall")
+        gmsh.model.addPhysicalGroup(1, [l_ff_left, l_ff_top], name="farfield")
+        gmsh.model.addPhysicalGroup(1, [l_ff_right], name="outflow")
+        gmsh.model.addPhysicalGroup(1, [l_axis_front, l_axis_back], name="axis")
+        gmsh.model.addPhysicalGroup(2, [surface], name="fluid")
+
+        gmsh.model.mesh.generate(2)
+
+        node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
+        elem_types, _, elem_node_tags = gmsh.model.mesh.getElements(dim=2)
+        if len(elem_types) == 0:
+            raise RuntimeError("Gmsh generated no 2D elements.")
+        tri_idx, quad_idx = extract_plot_elements(np.asarray(node_tags, dtype=int), elem_types, elem_node_tags)
+
+        output_msh.parent.mkdir(parents=True, exist_ok=True)
+        gmsh.write(str(output_msh))
+        return (
+            np.asarray(node_tags, dtype=int),
+            np.asarray(node_coords, dtype=float).reshape(-1, 3),
+            tri_idx,
+            quad_idx,
+            list(elem_types),
+            bool(use_boundary_layer and bl_curves),
+            domain_radius,
+            L,
+            R_max,
+        )
+    finally:
+        gmsh.finalize()
+
+
+def build_mesh(
+    csv_path: Path,
+    output_msh: Path,
+    output_png: Path,
+    show_plot: bool = False,
+) -> None:
+    if not show_plot:
+        os.environ.setdefault("MPLBACKEND", "Agg")
+    os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-codex")
+
+    import matplotlib.collections as mcoll
+    import matplotlib.pyplot as plt
+    import matplotlib.tri as mtri
+
+    nose_x, base_x, x_coords, r_coords = load_profile(csv_path)
+
+    L = float(x_coords.max() - x_coords.min())
+    R_max = float(r_coords.max())
+    if L <= 0 or R_max <= 0:
+        raise ValueError("Profile dimensions must be positive.")
+    if HWALL_FRAC * R_max <= 0:
+        raise ValueError("Computed first-layer height must be positive.")
+
+    mesh_result = None
+    last_error = None
+    for use_boundary_layer in (True, False):
+        try:
+            mesh_result = generate_mesh_with_gmsh(
+                x_coords, r_coords, nose_x, base_x, output_msh, use_boundary_layer
+            )
+            break
+        except Exception as exc:
+            last_error = exc
+            if use_boundary_layer:
+                print("Boundary-layer meshing failed; retrying without BL field.")
+            else:
+                raise
+
+    if mesh_result is None:
+        raise last_error
+
+    node_tags, coords, tri_idx, quad_idx, elem_types, used_bl, domain_radius, L, R_max = mesh_result
+    triangulation = mtri.Triangulation(coords[:, 0], coords[:, 1], tri_idx)
+
+    def draw_mesh(ax, tri_lw: float, quad_lw: float) -> None:
+        if len(tri_idx):
+            ax.triplot(triangulation, color="#9fc5e8", lw=tri_lw, zorder=1)
+        if len(quad_idx):
+            quad_polys = coords[quad_idx][:, :, :2]
+            quad_collection = mcoll.PolyCollection(
+                quad_polys,
+                facecolors="none",
+                edgecolors="#2b6cb0",
+                linewidths=quad_lw,
+                zorder=2,
+            )
+            ax.add_collection(quad_collection)
+
+    fig = plt.figure(figsize=(16, 12))
+
+    ax1 = plt.subplot(2, 2, 1)
+    draw_mesh(ax1, tri_lw=0.12, quad_lw=0.28)
+    ax1.fill_between(x_coords, 0.0, r_coords, color="dimgray", zorder=3)
+    ax1.set_xlim(nose_x - 0.15 * domain_radius, base_x + 0.15 * domain_radius)
+    ax1.set_ylim(0.0, 0.15 * domain_radius)
+    ax1.set_title("Full Domain (cropped)")
+    ax1.set_aspect("equal")
+
+    ax2 = plt.subplot(2, 2, 2)
+    draw_mesh(ax2, tri_lw=0.18, quad_lw=0.45)
+    ax2.fill_between(x_coords, 0.0, r_coords, color="dimgray", zorder=3)
+    ax2.plot(x_coords, r_coords, "r-", lw=1.2, zorder=4)
+    ax2.set_xlim(nose_x - 0.05 * L, base_x + 0.1 * L)
+    ax2.set_ylim(0.0, 3.0 * R_max)
+    ax2.set_title("Near Body")
+    ax2.set_aspect("equal")
+
+    ax3 = plt.subplot(2, 2, 3)
+    draw_mesh(ax3, tri_lw=0.25, quad_lw=0.7)
+    ax3.fill_between(x_coords, 0.0, r_coords, color="dimgray", zorder=3)
+    ax3.plot(x_coords, r_coords, "r-", lw=1.5, zorder=4)
+    mid_x = 0.5 * (nose_x + base_x)
+    zoom_half_width = max(0.05 * L, 1.0)
+    ax3.set_xlim(mid_x - zoom_half_width, mid_x + zoom_half_width)
+    ax3.set_ylim(max(0.0, R_max - 0.3 * R_max), R_max + 0.5 * R_max)
+    ax3.set_title("Boundary Layer Zoom")
+    ax3.set_aspect("equal")
+
+    ax4 = plt.subplot(2, 2, 4)
+    draw_mesh(ax4, tri_lw=0.28, quad_lw=0.85)
+    ax4.fill_between(x_coords, 0.0, r_coords, color="dimgray", zorder=3)
+    ax4.plot(x_coords, r_coords, "r-", lw=1.5, zorder=4)
+    peak_idx = int(np.argmax(r_coords))
+    peak_x = float(x_coords[peak_idx])
+    local_half_width = max(0.03 * L, 0.25)
+    local_y_pad = max(0.25 * R_max, 0.03)
+    ax4.set_xlim(max(nose_x - 0.02 * L, peak_x - local_half_width), min(base_x + 0.02 * L, peak_x + local_half_width))
+    ax4.set_ylim(max(0.0, r_coords[peak_idx] - local_y_pad), min(1.3 * R_max, r_coords[peak_idx] + local_y_pad))
+    ax4.set_title("Wall-Near Zoom")
+    ax4.set_aspect("equal")
+
+    plt.tight_layout()
+    output_png.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_png, dpi=250, bbox_inches="tight")
+    if show_plot:
+        plt.show()
+    plt.close(fig)
+
+    print(f"CSV : {csv_path}")
+    print(f"MSH : {output_msh}")
+    print(f"PNG : {output_png}")
+    print(f"Boundary layer used: {used_bl}")
+    print(f"2D element types: {list(elem_types)}")
+    print(f"Nodes: {len(node_tags)}")
+    print(f"Triangles: {len(tri_idx)}")
+    print(f"Quads: {len(quad_idx)}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Generate and render a 2D axisymmetric rocket mesh from CSV.")
+    parser.add_argument("csv_file", nargs="?", default=DEFAULT_INPUT_CSV, help="Input CSV file name or path.")
+    parser.add_argument("--csv", dest="csv_flag", default=None, help="Input CSV path.")
+    parser.add_argument("--cvs", dest="csv_flag_typo", default=None, help="Alias for --csv.")
+    parser.add_argument("--msh", default=DEFAULT_OUTPUT_MSH, help="Output .msh path.")
+    parser.add_argument("--png", default=DEFAULT_OUTPUT_PNG, help="Output preview image path.")
+    parser.add_argument("--show", action="store_true", help="Display the matplotlib window.")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    csv_input = args.csv_flag or args.csv_flag_typo or args.csv_file
+    csv_path = resolve_csv_path(csv_input)
+    output_msh = Path(args.msh).expanduser().resolve()
+    output_png = Path(args.png).expanduser().resolve()
+    build_mesh(csv_path, output_msh, output_png, show_plot=args.show)
+
+
+if __name__ == "__main__":
+    main()
