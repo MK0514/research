@@ -1,0 +1,383 @@
+import argparse
+import json
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+os.environ.setdefault("MPLBACKEND", "Agg")
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-codex")
+
+import matplotlib.pyplot as plt
+
+
+DEFAULT_INPUT_CSV = "Falcon9_profile.csv"
+DEFAULT_OUTPUT_VTK = "multiblock_coring_hybrid.vtk"
+DEFAULT_OUTPUT_PNG = "multiblock_coring_hybrid.png"
+DEFAULT_OUTPUT_NPZ = "multiblock_coring_hybrid.npz"
+
+AXIS_TOL = 1.0e-9
+AUTO_SCALE_MM_THRESHOLD = 100.0
+
+N_RING_I = 520
+N_RING_J = 44
+N_OUTER_J = 96
+
+RING_FIRST_LAYER_FRAC = 0.004
+RING_GROWTH = 1.16
+RING_THICK_FRAC = 0.22
+OUTER_GROWTH = 1.03
+OUTER_SCALE_X = 8.0
+OUTER_SCALE_Y = 5.0
+WAKE_STRETCH = 3.5
+
+
+@dataclass
+class Block:
+    name: str
+    x: np.ndarray
+    y: np.ndarray
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
+def resolve_csv_path(csv_path: str) -> Path:
+    candidate = Path(csv_path).expanduser()
+    if candidate.is_file():
+        return candidate.resolve()
+    script_dir = Path(__file__).resolve().parent
+    script_relative = (script_dir / candidate).resolve()
+    if script_relative.is_file():
+        return script_relative
+    cwd_relative = (Path.cwd() / candidate).resolve()
+    if cwd_relative.is_file():
+        return cwd_relative
+    raise FileNotFoundError(
+        f"CSV file not found: '{csv_path}'. Checked '{candidate}', '{script_relative}', and '{cwd_relative}'."
+    )
+
+
+def load_profile(csv_path: Path) -> tuple[np.ndarray, np.ndarray]:
+    df = pd.read_csv(csv_path)
+    df.columns = df.columns.str.strip().str.lower()
+    x = next((df[col].to_numpy() for col in ("x", "x_m") if col in df.columns), df.iloc[:, 0].to_numpy())
+    r = next((df[col].to_numpy() for col in ("r", "r_m") if col in df.columns), df.iloc[:, 1].to_numpy())
+
+    valid = np.isfinite(x) & np.isfinite(r)
+    x = x[valid].astype(float, copy=False)
+    r = r[valid].astype(float, copy=False)
+    order = np.argsort(x, kind="stable")
+    x = x[order]
+    r = r[order]
+
+    if np.nanmax(np.abs(r)) > AUTO_SCALE_MM_THRESHOLD:
+        x *= 0.001
+        r *= 0.001
+
+    keep = np.ones_like(x, dtype=bool)
+    keep[1:] = np.diff(x) > 1.0e-12
+    x = x[keep]
+    r = r[keep]
+
+    wall_mask = r > AXIS_TOL
+    if np.count_nonzero(wall_mask) < 2:
+        raise ValueError("Profile must contain at least two off-axis wall points.")
+    return x[wall_mask], r[wall_mask]
+
+
+def cumulative_arclength(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    ds = np.sqrt(np.diff(x) ** 2 + np.diff(y) ** 2)
+    return np.concatenate(([0.0], np.cumsum(ds)))
+
+
+def resample_closed_curve(x: np.ndarray, y: np.ndarray, num: int) -> tuple[np.ndarray, np.ndarray]:
+    x_closed = np.append(x, x[0])
+    y_closed = np.append(y, y[0])
+    s = cumulative_arclength(x_closed, y_closed)
+    s_target = np.linspace(0.0, s[-1], num + 1)[:-1]
+    return np.interp(s_target, s, x_closed), np.interp(s_target, s, y_closed)
+
+
+def build_closed_body(x: np.ndarray, r: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    top_x = x
+    top_y = r
+    bottom_x = x[-2:0:-1]
+    bottom_y = -r[-2:0:-1]
+    return np.concatenate([top_x, bottom_x]), np.concatenate([top_y, bottom_y])
+
+
+def compute_closed_normals(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    dx = np.roll(x, -1) - np.roll(x, 1)
+    dy = np.roll(y, -1) - np.roll(y, 1)
+    mag = np.sqrt(dx * dx + dy * dy)
+    tx = dx / mag
+    ty = dy / mag
+    nx = -ty
+    ny = tx
+    cx = np.mean(x)
+    cy = np.mean(y)
+    orient = np.sign((x - cx) * nx + (y - cy) * ny)
+    orient[orient == 0.0] = 1.0
+    nx *= orient
+    ny *= orient
+    nmag = np.sqrt(nx * nx + ny * ny)
+    return nx / nmag, ny / nmag
+
+
+def stretching_parameter(num: int, ratio: float) -> np.ndarray:
+    if num < 2:
+        return np.array([0.0], dtype=float)
+    if abs(ratio - 1.0) < 1.0e-12:
+        return np.linspace(0.0, 1.0, num)
+    weights = ratio ** np.arange(num - 1, dtype=float)
+    cumulative = np.concatenate(([0.0], np.cumsum(weights)))
+    return cumulative / cumulative[-1]
+
+
+def ring_distances(r_max: float) -> np.ndarray:
+    first = RING_FIRST_LAYER_FRAC * r_max
+    target = RING_THICK_FRAC * r_max
+    dist = np.zeros(N_RING_J, dtype=float)
+    step = first
+    for j in range(1, N_RING_J):
+        dist[j] = dist[j - 1] + step
+        step *= RING_GROWTH
+    if dist[-1] > 0.0:
+        dist *= target / dist[-1]
+    return dist
+
+
+def build_oring_block(body_x: np.ndarray, body_y: np.ndarray) -> Block:
+    inner_x, inner_y = resample_closed_curve(body_x, body_y, N_RING_I)
+    nx, ny = compute_closed_normals(inner_x, inner_y)
+    dist = ring_distances(float(np.max(np.abs(body_y))))
+    x = np.zeros((N_RING_J, N_RING_I), dtype=float)
+    y = np.zeros_like(x)
+    for j in range(N_RING_J):
+        x[j, :] = inner_x + dist[j] * nx
+        y[j, :] = inner_y + dist[j] * ny
+    return Block("oring", x, y)
+
+
+def build_farfield_contour(outer_x: np.ndarray, outer_y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    cx = 0.5 * (float(np.min(outer_x)) + float(np.max(outer_x)))
+    cy = 0.0
+    body_len = float(np.max(outer_x) - np.min(outer_x))
+    dx = outer_x - cx
+    dy = outer_y - cy
+    far_x = cx + OUTER_SCALE_X * dx
+    far_y = cy + OUTER_SCALE_Y * dy
+
+    right_bias = np.clip(dx / max(1.0e-12, 0.5 * body_len), 0.0, None)
+    far_x += WAKE_STRETCH * body_len * right_bias**2
+    return far_x, far_y
+
+
+def sector_indices(x: np.ndarray, y: np.ndarray) -> list[tuple[str, int, int]]:
+    n = len(x)
+    nose_upper = 0
+    upper = np.flatnonzero(y >= 0.0)
+    lower = np.flatnonzero(y < 0.0)
+    base_upper = int(upper[np.argmax(x[upper])])
+    base_lower = int(lower[np.argmax(x[lower])])
+    nose_lower = int(lower[np.argmin(x[lower])])
+    return [
+        ("upper", nose_upper, base_upper),
+        ("wake", base_upper, base_lower),
+        ("lower", base_lower, nose_lower),
+        ("fore", nose_lower, nose_upper + n),
+    ]
+
+
+def extract_sector(arr: np.ndarray, start: int, stop: int) -> np.ndarray:
+    n = len(arr)
+    idx = np.arange(start, stop + 1) % n
+    return arr[idx]
+
+
+def build_outer_sector_blocks(oring: Block) -> list[Block]:
+    outer_x = oring.x[-1, :]
+    outer_y = oring.y[-1, :]
+    far_x, far_y = build_farfield_contour(outer_x, outer_y)
+    sectors = sector_indices(outer_x, outer_y)
+    eta = stretching_parameter(N_OUTER_J, OUTER_GROWTH)
+
+    blocks: list[Block] = []
+    for name, start, stop in sectors:
+        inner_sx = extract_sector(outer_x, start, stop)
+        inner_sy = extract_sector(outer_y, start, stop)
+        far_sx = extract_sector(far_x, start, stop)
+        far_sy = extract_sector(far_y, start, stop)
+        ni = inner_sx.size
+        x = np.zeros((N_OUTER_J, ni), dtype=float)
+        y = np.zeros_like(x)
+        for j in range(N_OUTER_J):
+            x[j, :] = (1.0 - eta[j]) * inner_sx + eta[j] * far_sx
+            y[j, :] = (1.0 - eta[j]) * inner_sy + eta[j] * far_sy
+        blocks.append(Block(f"outer_{name}", x, y))
+    return blocks
+
+
+def build_multiblock(body_x: np.ndarray, body_r: np.ndarray) -> tuple[list[Block], np.ndarray, np.ndarray]:
+    closed_x, closed_y = build_closed_body(body_x, body_r)
+    oring = build_oring_block(closed_x, closed_y)
+    outer_blocks = build_outer_sector_blocks(oring)
+    return [oring, *outer_blocks], closed_x, closed_y
+
+
+def merge_blocks(blocks: list[Block]) -> tuple[np.ndarray, list[tuple[int, int, int, int]], np.ndarray]:
+    point_map: dict[tuple[int, int], int] = {}
+    points: list[tuple[float, float, float]] = []
+    cells: list[tuple[int, int, int, int]] = []
+    cell_block_ids: list[int] = []
+
+    def key(x: float, y: float) -> tuple[int, int]:
+        return (int(round(x * 1.0e9)), int(round(y * 1.0e9)))
+
+    for bid, block in enumerate(blocks):
+        nj, ni = block.x.shape
+        local = np.zeros((nj, ni), dtype=int)
+        for j in range(nj):
+            for i in range(ni):
+                k = key(float(block.x[j, i]), float(block.y[j, i]))
+                if k not in point_map:
+                    point_map[k] = len(points)
+                    points.append((float(block.x[j, i]), float(block.y[j, i]), 0.0))
+                local[j, i] = point_map[k]
+
+        periodic = block.name == "oring"
+        for j in range(nj - 1):
+            i_max = ni if periodic else ni - 1
+            for i in range(i_max):
+                i_next = (i + 1) % ni if periodic else i + 1
+                if not periodic and i_next >= ni:
+                    continue
+                cells.append((local[j, i], local[j, i_next], local[j + 1, i_next], local[j + 1, i]))
+                cell_block_ids.append(bid)
+
+    return np.asarray(points, dtype=float), cells, np.asarray(cell_block_ids, dtype=int)
+
+
+def write_vtk(path: Path, points: np.ndarray, cells: list[tuple[int, int, int, int]], cell_block_ids: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="ascii") as f:
+        f.write("# vtk DataFile Version 3.0\n")
+        f.write("Multi-block C/O-ring hybrid mesh\n")
+        f.write("ASCII\n")
+        f.write("DATASET UNSTRUCTURED_GRID\n")
+        f.write(f"POINTS {len(points)} float\n")
+        for px, py, pz in points:
+            f.write(f"{px:.10e} {py:.10e} {pz:.10e}\n")
+        f.write(f"\nCELLS {len(cells)} {len(cells) * 5}\n")
+        for c in cells:
+            f.write(f"4 {c[0]} {c[1]} {c[2]} {c[3]}\n")
+        f.write(f"\nCELL_TYPES {len(cells)}\n")
+        for _ in cells:
+            f.write("9\n")
+        f.write(f"\nCELL_DATA {len(cells)}\n")
+        f.write("SCALARS block_id int 1\n")
+        f.write("LOOKUP_TABLE default\n")
+        for bid in cell_block_ids:
+            f.write(f"{int(bid)}\n")
+
+
+def plot_blocks(blocks: list[Block], body_x: np.ndarray, body_y: np.ndarray, png_path: Path) -> None:
+    fig = plt.figure(figsize=(15, 14))
+
+    def draw(ax, xlim=None, ylim=None) -> None:
+        for block in blocks:
+            ax.plot(block.x.T, block.y.T, color="#2b6cb0", lw=0.22, alpha=0.9)
+            ax.plot(block.x, block.y, color="#2b6cb0", lw=0.22, alpha=0.9)
+        ax.fill(body_x, body_y, color="dimgray", zorder=3)
+        ax.plot(body_x, body_y, color="red", lw=1.2, zorder=4)
+        ax.set_aspect("equal")
+        if xlim:
+            ax.set_xlim(*xlim)
+        if ylim:
+            ax.set_ylim(*ylim)
+
+    all_x = np.concatenate([b.x.ravel() for b in blocks])
+    all_y = np.concatenate([b.y.ravel() for b in blocks])
+    x_min, x_max = float(np.min(all_x)), float(np.max(all_x))
+    y_min, y_max = float(np.min(all_y)), float(np.max(all_y))
+    body_len = float(np.max(body_x) - np.min(body_x))
+    r_max = float(np.max(np.abs(body_y)))
+
+    ax1 = plt.subplot(2, 2, 1)
+    draw(ax1, (x_min, x_max), (y_min, y_max))
+    ax1.set_title("Unified C/O Hybrid")
+
+    ax2 = plt.subplot(2, 2, 2)
+    draw(ax2, (np.min(body_x) - 0.2 * body_len, np.max(body_x) + 0.4 * body_len), (-3.0 * r_max, 3.0 * r_max))
+    ax2.set_title("Near Body + Wake")
+
+    peak = int(np.argmax(body_y))
+    ax3 = plt.subplot(2, 2, 3)
+    draw(ax3, (body_x[peak] - 1.5, body_x[peak] + 1.5), (body_y[peak] - 0.8, body_y[peak] + 0.8))
+    ax3.set_title("Shoulder / Wall Zoom")
+
+    ax4 = plt.subplot(2, 2, 4)
+    draw(ax4, (np.max(body_x) - 2.0, np.max(body_x) + 6.0), (-1.8, 1.8))
+    ax4.set_title("Base / Wake Sector")
+
+    plt.tight_layout()
+    png_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(png_path, dpi=250, bbox_inches="tight")
+    plt.close(fig)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Create unified multi-block C/O-ring hybrid mesh.")
+    parser.add_argument("csv_file", nargs="?", default=DEFAULT_INPUT_CSV, help="Input CSV file name or path.")
+    parser.add_argument("--vtk", default=DEFAULT_OUTPUT_VTK, help="Output VTK file path.")
+    parser.add_argument("--png", default=DEFAULT_OUTPUT_PNG, help="Output PNG file path.")
+    parser.add_argument("--npz", default=DEFAULT_OUTPUT_NPZ, help="Output NPZ file path.")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    log("CSV 로드중...")
+    csv_path = resolve_csv_path(args.csv_file)
+    vtk_path = Path(args.vtk).expanduser().resolve()
+    png_path = Path(args.png).expanduser().resolve()
+    npz_path = Path(args.npz).expanduser().resolve()
+
+    body_x_half, body_r_half = load_profile(csv_path)
+    log("C/O 하이브리드 멀티블록 생성중...")
+    blocks, body_x, body_y = build_multiblock(body_x_half, body_r_half)
+    log("블록 병합중...")
+    points, cells, cell_block_ids = merge_blocks(blocks)
+    log("VTK 저장중...")
+    write_vtk(vtk_path, points, cells, cell_block_ids)
+    log("렌더링중...")
+    plot_blocks(blocks, body_x, body_y, png_path)
+    log("격자 데이터 저장중...")
+    np.savez(
+        npz_path,
+        points=points,
+        cells=np.asarray(cells, dtype=int),
+        cell_block_ids=cell_block_ids,
+        block_names=np.asarray([b.name for b in blocks]),
+        block_shapes=np.asarray([b.x.shape for b in blocks], dtype=int),
+        body_x=body_x,
+        body_y=body_y,
+    )
+
+    print(f"CSV : {csv_path}")
+    print(f"VTK : {vtk_path}")
+    print(f"PNG : {png_path}")
+    print(f"NPZ : {npz_path}")
+    print(f"Blocks : {[b.name for b in blocks]}")
+    print(f"Points : {len(points)}")
+    print(f"Quad cells : {len(cells)}")
+    print(f"Block shapes : {[b.x.shape for b in blocks]}")
+    print(f"Cell blocks : {json.dumps({b.name: int(np.sum(cell_block_ids == i)) for i, b in enumerate(blocks)})}")
+
+
+if __name__ == "__main__":
+    main()
