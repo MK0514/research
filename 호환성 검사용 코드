@@ -1,0 +1,401 @@
+'''python (경로) mesh_compatibility_check.py (검사파일이름).npz or msh or csv
+#npz 파일이 검증하기 가장 좋고, msh 파일은 geometry만 가능'''
+'''negative_or_zero_area_cells
+가장 중요합니다. 0이어야 좋습니다.
+0이 아니면 셀이 접히거나 뒤집힌 겁니다.
+min_signed_area
+양수 쪽이 안전합니다.
+음수가 나오면 folded cell이 있다는 뜻입니다.
+max_orthogonality_error_deg
+작을수록 좋습니다.
+0이면 완전 직교이고, 커질수록 skew가 심합니다.
+mean_orthogonality_error_deg
+전체 평균 왜곡 정도입니다.
+이것도 작을수록 좋습니다.
+global_aspect_ratio
+무조건 작아야 한다기보단, 너무 크면 stiffness가 커집니다.
+경계층에서는 커질 수 있지만, 전체적으로 과도하면 부담입니다.
+tdma_i_dry_run, tdma_j_dry_run
+둘 다 true가 좋습니다.
+최소한 line solve 구조가 성립하는지 보는 아주 기초 체크입니다.
+interfaces
+block 경계가 정확히 붙는지 보는 값입니다.
+0 또는 아주 작은 수치여야 좋습니다.
+compatible_with_structured_adi_tdma
+위 조건들을 종합한 최종 판정입니다.
+true면 최소한 구조적 호환성은 통과했다는 뜻입니다.'''
+
+import argparse
+import json
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+
+import multiblock_coring_hybrid_mesh as hybrid_mesh
+
+
+@dataclass
+class StructuredBlock:
+    name: str
+    x: np.ndarray
+    y: np.ndarray
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
+def resolve_input_path(mesh_input: str) -> Path:
+    candidate = Path(mesh_input).expanduser()
+    if candidate.is_file():
+        return candidate.resolve()
+
+    script_dir = Path(__file__).resolve().parent
+    script_relative = (script_dir / candidate).resolve()
+    if script_relative.is_file():
+        return script_relative
+
+    cwd_relative = (Path.cwd() / candidate).resolve()
+    if cwd_relative.is_file():
+        return cwd_relative
+
+    raise FileNotFoundError(
+        f"Input mesh file not found: '{mesh_input}'. Checked '{candidate}', '{script_relative}', and '{cwd_relative}'."
+    )
+
+
+def cell_signed_areas(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    p00x = x[:-1, :-1]
+    p00y = y[:-1, :-1]
+    p10x = x[:-1, 1:]
+    p10y = y[:-1, 1:]
+    p11x = x[1:, 1:]
+    p11y = y[1:, 1:]
+    p01x = x[1:, :-1]
+    p01y = y[1:, :-1]
+    return 0.5 * (
+        p00x * p10y
+        - p00y * p10x
+        + p10x * p11y
+        - p10y * p11x
+        + p11x * p01y
+        - p11y * p01x
+        + p01x * p00y
+        - p01y * p00x
+    )
+
+
+def quad_signed_areas(points: np.ndarray, cells: np.ndarray) -> np.ndarray:
+    q = points[cells, :2]
+    x = q[:, :, 0]
+    y = q[:, :, 1]
+    return 0.5 * np.sum(x * np.roll(y, -1, axis=1) - y * np.roll(x, -1, axis=1), axis=1)
+
+
+def edge_lengths(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    li = np.sqrt(np.diff(x, axis=1) ** 2 + np.diff(y, axis=1) ** 2)
+    lj = np.sqrt(np.diff(x, axis=0) ** 2 + np.diff(y, axis=0) ** 2)
+    return li, lj
+
+
+def quad_edge_lengths(points: np.ndarray, cells: np.ndarray) -> np.ndarray:
+    q = points[cells, :2]
+    return np.sqrt(np.sum((np.roll(q, -1, axis=1) - q) ** 2, axis=2))
+
+
+def orthogonality_angles_deg(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    vi_x = 0.5 * (x[1:, 1:] - x[1:, :-1] + x[:-1, 1:] - x[:-1, :-1])
+    vi_y = 0.5 * (y[1:, 1:] - y[1:, :-1] + y[:-1, 1:] - y[:-1, :-1])
+    vj_x = 0.5 * (x[1:, 1:] - x[:-1, 1:] + x[1:, :-1] - x[:-1, :-1])
+    vj_y = 0.5 * (y[1:, 1:] - y[:-1, 1:] + y[1:, :-1] - y[:-1, :-1])
+    dot = vi_x * vj_x + vi_y * vj_y
+    mag = np.sqrt(vi_x * vi_x + vi_y * vi_y) * np.sqrt(vj_x * vj_x + vj_y * vj_y)
+    cosang = np.clip(dot / np.maximum(mag, 1.0e-14), -1.0, 1.0)
+    return np.degrees(np.arccos(cosang))
+
+
+def wall_normal_spacing(block: StructuredBlock) -> np.ndarray:
+    return np.sqrt((block.x[1, :] - block.x[0, :]) ** 2 + (block.y[1, :] - block.y[0, :]) ** 2)
+
+
+def monotonic_spacing_ok(spacing: np.ndarray, growth_limit: float = 1.35) -> bool:
+    ratio = spacing[1:] / np.maximum(spacing[:-1], 1.0e-14)
+    return bool(np.all(ratio < growth_limit))
+
+
+def boundary_match_error(ax: np.ndarray, ay: np.ndarray, bx: np.ndarray, by: np.ndarray) -> float:
+    errs = np.sqrt((ax - bx) ** 2 + (ay - by) ** 2)
+    return float(np.max(errs)) if errs.size else 0.0
+
+
+def thomas_solve(a: np.ndarray, b: np.ndarray, c: np.ndarray, d: np.ndarray) -> np.ndarray:
+    n = len(d)
+    cp = np.zeros(n - 1)
+    dp = np.zeros(n)
+    cp[0] = c[0] / b[0]
+    dp[0] = d[0] / b[0]
+    for i in range(1, n - 1):
+        denom = b[i] - a[i - 1] * cp[i - 1]
+        cp[i] = c[i] / denom
+        dp[i] = (d[i] - a[i - 1] * dp[i - 1]) / denom
+    dp[-1] = (d[-1] - a[-1] * dp[-2]) / (b[-1] - a[-1] * cp[-2])
+    x = np.zeros(n)
+    x[-1] = dp[-1]
+    for i in range(n - 2, -1, -1):
+        x[i] = dp[i] - cp[i] * x[i + 1]
+    return x
+
+
+def dry_run_tdma(block: StructuredBlock, direction: str) -> bool:
+    nj, ni = block.x.shape
+    line_count = nj if direction == "i" else ni
+    line_len = ni if direction == "i" else nj
+    if line_len < 4:
+        return False
+    rhs = np.linspace(0.0, 1.0, line_len)
+    a = -0.2 * np.ones(line_len - 1)
+    b = np.ones(line_len)
+    c = -0.2 * np.ones(line_len - 1)
+    for _ in range(min(line_count, 5)):
+        sol = thomas_solve(a, b, c, rhs)
+        if not np.all(np.isfinite(sol)):
+            return False
+    return True
+
+
+def block_report(block: StructuredBlock) -> dict[str, object]:
+    areas = cell_signed_areas(block.x, block.y)
+    li, lj = edge_lengths(block.x, block.y)
+    angles = orthogonality_angles_deg(block.x, block.y)
+    min_edge = float(min(np.min(li), np.min(lj)))
+    max_edge = float(max(np.max(li), np.max(lj)))
+    aspect = float(max_edge / max(min_edge, 1.0e-14))
+    angle_dev = np.abs(angles - 90.0)
+
+    report: dict[str, object] = {
+        "shape": list(block.x.shape),
+        "min_signed_area": float(np.min(areas)),
+        "max_signed_area": float(np.max(areas)),
+        "negative_or_zero_area_cells": int(np.count_nonzero(areas <= 0.0)),
+        "min_edge": min_edge,
+        "max_edge": max_edge,
+        "global_aspect_ratio": aspect,
+        "max_orthogonality_error_deg": float(np.max(angle_dev)),
+        "mean_orthogonality_error_deg": float(np.mean(angle_dev)),
+        "tdma_i_dry_run": dry_run_tdma(block, "i"),
+        "tdma_j_dry_run": dry_run_tdma(block, "j"),
+    }
+    if block.x.shape[0] >= 2:
+        spacing = wall_normal_spacing(block)
+        report["wall_first_spacing_min"] = float(np.min(spacing))
+        report["wall_first_spacing_max"] = float(np.max(spacing))
+        report["wall_first_spacing_growth_ok"] = monotonic_spacing_ok(spacing)
+    return report
+
+
+def structured_verdict(summary: dict[str, object]) -> tuple[bool, list[str]]:
+    notes: list[str] = []
+    ok = True
+    for name, rep in summary["blocks"].items():
+        if rep["negative_or_zero_area_cells"] > 0:
+            ok = False
+            notes.append(f"{name}: negative/zero area cell exists")
+        if rep["max_orthogonality_error_deg"] > 45.0:
+            notes.append(f"{name}: large skew/orthogonality error near some cells")
+        if not rep["tdma_i_dry_run"] or not rep["tdma_j_dry_run"]:
+            ok = False
+            notes.append(f"{name}: TDMA dry-run failed")
+    for iface, err in summary.get("interfaces", {}).items():
+        if err > 1.0e-8:
+            ok = False
+            notes.append(f"{iface}: interface mismatch {err:.3e}")
+    return ok, notes
+
+
+def check_hybrid_interfaces(blocks: list[StructuredBlock]) -> dict[str, float]:
+    by_name = {b.name: b for b in blocks}
+    if "oring" not in by_name:
+        return {}
+    oring = by_name["oring"]
+    outer_edge_x = oring.x[-1, :]
+    outer_edge_y = oring.y[-1, :]
+    _, _, arc_ranges = hybrid_mesh.build_partitioned_ring(oring.x[0, :], oring.y[0, :])
+    results: dict[str, float] = {}
+    for name, (start, stop) in arc_ranges.items():
+        key = f"outer_{name}"
+        if key not in by_name:
+            continue
+        block = by_name[key]
+        count = stop - start
+        ref_x = hybrid_mesh.periodic_segment(outer_edge_x, start, count)
+        ref_y = hybrid_mesh.periodic_segment(outer_edge_y, start, count)
+        if name in {"lower", "fore"}:
+            ref_x = ref_x[::-1]
+            ref_y = ref_y[::-1]
+        results[f"oring_to_outer_{name}"] = boundary_match_error(block.x[0, :], block.y[0, :], ref_x, ref_y)
+    return results
+
+
+def run_csv_check(csv_file: str) -> dict[str, object]:
+    csv_path = hybrid_mesh.resolve_csv_path(csv_file)
+    body_x_half, body_r_half = hybrid_mesh.load_profile(csv_path)
+    blocks_raw, body_x, body_y = hybrid_mesh.build_multiblock(body_x_half, body_r_half)
+    blocks = [StructuredBlock(b.name, b.x, b.y) for b in blocks_raw]
+    reports = {block.name: block_report(block) for block in blocks}
+    interfaces = check_hybrid_interfaces(blocks)
+    summary: dict[str, object] = {
+        "input_type": "csv-hybrid-generator",
+        "input": str(csv_path),
+        "body_length": float(np.max(body_x) - np.min(body_x)),
+        "body_radius_max": float(np.max(np.abs(body_y))),
+        "block_count": len(blocks),
+        "blocks": reports,
+        "interfaces": interfaces,
+    }
+    ok, notes = structured_verdict(summary)
+    summary["compatible_with_structured_adi_tdma"] = ok
+    summary["notes"] = notes
+    return summary
+
+
+def build_blocks_from_npz(data: np.lib.npyio.NpzFile) -> list[StructuredBlock]:
+    if "x_grid" in data.files and "y_grid" in data.files:
+        return [StructuredBlock("grid", data["x_grid"], data["y_grid"])]
+
+    if "block_names" in data.files and "block_shapes" in data.files and "points" in data.files and "cells" in data.files:
+        # We can only do geometry-level fallback here because ij reconstruction is not stored.
+        return []
+
+    raise ValueError("NPZ must contain either x_grid/y_grid for structured checks, or points/cells for geometry checks.")
+
+
+def run_structured_npz_check(npz_path: Path) -> dict[str, object]:
+    data = np.load(npz_path, allow_pickle=True)
+    blocks = build_blocks_from_npz(data)
+    reports = {block.name: block_report(block) for block in blocks}
+    summary: dict[str, object] = {
+        "input_type": "structured-npz",
+        "input": str(npz_path),
+        "block_count": len(blocks),
+        "blocks": reports,
+        "interfaces": {},
+    }
+    ok, notes = structured_verdict(summary)
+    summary["compatible_with_structured_adi_tdma"] = ok
+    summary["notes"] = notes
+    return summary
+
+
+def parse_gmsh22_msh(msh_path: Path) -> tuple[np.ndarray, np.ndarray]:
+    lines = msh_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    nodes: dict[int, tuple[float, float, float]] = {}
+    quads: list[list[int]] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if line == "$Nodes":
+            count = int(lines[i + 1].strip())
+            for j in range(count):
+                parts = lines[i + 2 + j].split()
+                nid = int(parts[0])
+                nodes[nid] = (float(parts[1]), float(parts[2]), float(parts[3]))
+            i += count + 2
+        elif line == "$Elements":
+            count = int(lines[i + 1].strip())
+            for j in range(count):
+                parts = lines[i + 2 + j].split()
+                etype = int(parts[1])
+                ntags = int(parts[2])
+                conn = [int(v) for v in parts[3 + ntags :]]
+                if etype == 3 and len(conn) == 4:
+                    quads.append([c - 1 for c in conn])
+            i += count + 2
+        else:
+            i += 1
+    if not nodes or not quads:
+        raise ValueError("MSH file does not contain readable nodes and quadrilateral elements.")
+    max_id = max(nodes)
+    points = np.zeros((max_id, 3), dtype=float)
+    for nid, xyz in nodes.items():
+        points[nid - 1, :] = xyz
+    return points, np.asarray(quads, dtype=int)
+
+
+def run_geometry_check(points: np.ndarray, cells: np.ndarray, source: str, input_type: str) -> dict[str, object]:
+    areas = quad_signed_areas(points, cells)
+    edges = quad_edge_lengths(points, cells)
+    min_edge = float(np.min(edges))
+    max_edge = float(np.max(edges))
+    aspect = float(max_edge / max(min_edge, 1.0e-14))
+    negative = int(np.count_nonzero(areas <= 0.0))
+
+    summary: dict[str, object] = {
+        "input_type": input_type,
+        "input": source,
+        "points": int(len(points)),
+        "quad_cells": int(len(cells)),
+        "geometry_only_check": True,
+        "geometry": {
+            "min_signed_area": float(np.min(areas)),
+            "max_signed_area": float(np.max(areas)),
+            "negative_or_zero_area_cells": negative,
+            "min_edge": min_edge,
+            "max_edge": max_edge,
+            "global_aspect_ratio": aspect,
+        },
+        "compatible_with_structured_adi_tdma": False,
+        "notes": [
+            "Only geometry-level checks were possible.",
+            "Structured ADI/TDMA compatibility needs ij-ordered grid data such as x_grid/y_grid arrays.",
+        ],
+    }
+    return summary
+
+
+def run_npz_geometry_fallback(npz_path: Path) -> dict[str, object]:
+    data = np.load(npz_path, allow_pickle=True)
+    if "points" not in data.files or "cells" not in data.files:
+        raise ValueError("Geometry fallback requires points and cells arrays in the NPZ file.")
+    return run_geometry_check(data["points"], data["cells"], str(npz_path), "geometry-npz")
+
+
+def run_input_check(input_path: str) -> dict[str, object]:
+    path = resolve_input_path(input_path)
+    suffix = path.suffix.lower()
+
+    if suffix == ".csv":
+        return run_csv_check(str(path))
+    if suffix == ".npz":
+        data = np.load(path, allow_pickle=True)
+        if "x_grid" in data.files and "y_grid" in data.files:
+            data.close()
+            return run_structured_npz_check(path)
+        data.close()
+        return run_npz_geometry_fallback(path)
+    if suffix == ".msh":
+        points, cells = parse_gmsh22_msh(path)
+        return run_geometry_check(points, cells, str(path), "gmsh-msh")
+    raise ValueError("Unsupported input type. Use .csv, .npz, or .msh")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Check mesh compatibility with structured ADI/TDMA-style sweeps.")
+    parser.add_argument("mesh_input", nargs="?", default=hybrid_mesh.DEFAULT_INPUT_CSV, help="Input mesh file: .csv, .npz, or .msh")
+    parser.add_argument("--json", dest="json_path", default="", help="Optional path to save JSON report.")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    log("호환성 검증중...")
+    summary = run_input_check(args.mesh_input)
+    if args.json_path:
+        out = Path(args.json_path).expanduser().resolve()
+        out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        print(f"JSON : {out}")
+    print(json.dumps(summary, indent=2))
+
+
+if __name__ == "__main__":
+    main()
