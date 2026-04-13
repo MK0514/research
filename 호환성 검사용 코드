@@ -23,7 +23,8 @@ block 경계가 정확히 붙는지 보는 값입니다.
 0 또는 아주 작은 수치여야 좋습니다.
 compatible_with_structured_adi_tdma
 위 조건들을 종합한 최종 판정입니다.
-true면 최소한 구조적 호환성은 통과했다는 뜻입니다.'''
+true면 최소한 구조적 호환성은 통과했다는 뜻입니다.
+이 코드는 ADI+TDMA에 한 한 호환성 코드입니다. '''
 
 import argparse
 import json
