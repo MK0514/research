@@ -1,356 +1,587 @@
 """
-mesh.py
-=======
-2D axisymmetric CFD mesh: Inflation + Cartesian background.
-Works with any rocket profile CSV from stl_to_2d.py.
+2D axisymmetric hybrid mesh generator.
 
-Inflation layer count AUTO-COMPUTED from target thickness:
-  Default target = 1.0 x R_max  (covers full body radius)
-  growth=1.1 (default) -> ~64 layers for Falcon9
+Method:
+  1. Build inflation layers directly with NumPy by offsetting profile points
+     along smoothed outward normals.
+  2. Fill the outer region with a Gmsh Delaunay triangular mesh.
 
-Usage:
-  python mesh.py --profile Falcon9_profile.csv
-  python mesh.py --profile nuri.csv --output nuri_mesh
-  python mesh.py --profile rocket.csv --target_thickness 0.5 --supersonic
-
-Parameters:
-  --profile          CSV from stl_to_2d.py (required)
-  --first_cell       First layer height [m] (default: 5e-5)
-  --growth           Growth rate (default: 1.1)
-  --target_thickness Inflation thickness [m] (default: 1.0 x R_max)
-  --n_inf            Override: fixed layer count
-  --nj_body          Body surface points (default: 500)
-  --nj_cap           Nose/tail cap points each (default: 60)
-  --smooth_iter      Normal smoothing iterations (default: 3000)
-  --r_far            Far-field radius [m] (default: 20 x R_max)
-  --x_up_mult        Upstream extent in body lengths (default: 5)
-  --x_dn_mult        Downstream extent (default: 15)
-  --supersonic       Set x_up_mult=10
-  --output           Output prefix (default: <profile>_mesh)
+Output NPZ fields:
+  nodes      (N, 2)   all node coordinates [x, r]
+  quad_cells (M, 4)   inflation-layer quads
+  tri_cells  (K, 3)   outer triangular cells
+  face_nodes (F, 2, 2) boundary segments as coordinates
+  face_tag   (F,)     1=body 2=axis 3=inlet 4=outlet 5=farfield
+  bl_first_h, bl_layers, bl_growth
 """
-import argparse, os, csv
+
+import argparse
+import math
+import os
+import sys
+
 import numpy as np
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from matplotlib.collections import LineCollection
+
+try:
+    import gmsh
+except ImportError:
+    sys.exit("[ERROR] pip install gmsh")
 
 
 def load_profile(path):
-    bx, br = [], []
-    with open(path) as f:
-        for row in csv.DictReader(f):
-            bx.append(float(row['x_m']))
-            br.append(float(row['r_m']))
-    bx = np.array(bx); br = np.abs(np.array(br))
-    idx = np.argsort(bx); bx = bx[idx]; br = br[idx]
-    mask = br > br.max() * 1e-3
-    bx_b = bx[mask]; br_b = br[mask]
-    L = bx_b.max() - bx_b.min(); R_max = br_b.max()
-    print(f"[Profile] {len(bx_b)} pts | L={L:.4f}m | R_max={R_max:.4f}m | "
-          f"nose_r={br_b[0]:.5f}m | tail_r={br_b[-1]:.5f}m")
-    return bx_b, br_b, bx, br, L, R_max
+    """Load CSV profile, collapse duplicate x values, and enforce axis endpoints."""
+    raw = np.genfromtxt(path, delimiter=",", skip_header=1)
+    if raw.ndim != 2 or raw.shape[1] < 2:
+        raise ValueError(f"Invalid profile CSV: {path}")
+
+    raw = raw[:, :2]
+    raw = raw[np.isfinite(raw[:, 0]) & np.isfinite(raw[:, 1])]
+    if len(raw) < 2:
+        raise ValueError(f"Profile has too few valid points: {path}")
+
+    raw = raw[np.argsort(raw[:, 0])]
+    raw[:, 1] = np.maximum(raw[:, 1], 0.0)
+
+    collapsed = []
+    i = 0
+    while i < len(raw):
+        j = i + 1
+        while j < len(raw) and abs(raw[j, 0] - raw[i, 0]) < 1e-9:
+            j += 1
+        group = raw[i:j]
+        zeros = group[group[:, 1] < 1e-10]
+        collapsed.append(zeros[0] if len(zeros) else group[np.argmin(group[:, 1])])
+        i = j
+
+    pts = np.asarray(collapsed, dtype=np.float64)
+    _, idx = np.unique(np.round(pts, 12), axis=0, return_index=True)
+    pts = pts[np.sort(idx)]
+
+    if pts[0, 1] > 1e-8:
+        pts = np.vstack(([pts[0, 0], 0.0], pts))
+        print("  [auto] added nose axis point")
+    if pts[-1, 1] > 1e-8:
+        pts = np.vstack((pts, [pts[-1, 0], 0.0]))
+        print("  [auto] added tail axis point")
+
+    step = np.sqrt(np.sum(np.diff(pts, axis=0) ** 2, axis=1))
+    keep = np.concatenate(([True], step > 1e-12))
+    pts = pts[keep]
+    if len(pts) < 3:
+        raise ValueError("Profile collapsed to fewer than 3 unique points")
+
+    print(
+        f"  profile: {len(pts)} pt  "
+        f"x=[{pts[:,0].min():.3f},{pts[:,0].max():.3f}]  "
+        f"R={pts[:,1].max():.4f} m"
+    )
+    print(
+        f"  nose=({pts[0,0]:.5f},{pts[0,1]:.5f})  "
+        f"tail=({pts[-1,0]:.5f},{pts[-1,1]:.5f})"
+    )
+    return pts
 
 
-def compute_n_inf(first_cell, growth, target):
-    eta = [0.]; dh = first_cell; n = 0
-    while eta[-1] < target:
-        eta.append(eta[-1] + dh); dh *= growth; n += 1
-        if n > 5000: raise ValueError("Cannot reach target thickness")
-    print(f"[Inflate] Auto n_inf={n} | target={target:.4f}m | actual={eta[-1]:.5f}m")
-    return n
+def domain_params(pts, mach):
+    x0 = pts[:, 0].min()
+    x1 = pts[:, 0].max()
+    R = pts[:, 1].max()
+    L = x1 - x0
+
+    if mach >= 2.0:
+        up = max(3.0 * L, 10.0 * R)
+    elif mach >= 1.0:
+        up = max(5.0 * L, 20.0 * R)
+    else:
+        up = max(12.0 * L, 60.0 * R)
+
+    down = max(10.0 * L, 30.0 * R)
+    rfar = max(80.0 * R, 5.0 * L)
+    print(f"  domain: x=[{x0 - up:.1f},{x1 + down:.1f}]  r=[0,{rfar:.1f}] m")
+    return {
+        "x0": x0,
+        "x1": x1,
+        "R": R,
+        "L": L,
+        "x_in": x0 - up,
+        "x_out": x1 + down,
+        "r_far": rfar,
+    }
 
 
-def build_inflation(bx_b, br_b, first_cell, growth, n_inf,
-                    nj_body, nj_cap, smooth_iter):
-    # Eta
-    eta = [0.]; dh = first_cell
-    for _ in range(n_inf): eta.append(eta[-1] + dh); dh *= growth
-    eta = np.array(eta); d_inf = eta[-1]
-    print(f"[Inflate] Ni={len(eta)} | first={eta[1]:.2e}m | "
-          f"thickness={d_inf:.5f}m | last_cell={d_inf-eta[-2]:.5f}m")
-
-    # Nose cap: x=x_nose, r: 0->br_b[0], normal=(-1,0)
-    seg_nx  = np.full(nj_cap, bx_b[0])
-    seg_nr  = np.linspace(0., br_b[0], nj_cap)
-    seg_nnx = np.full(nj_cap, -1.); seg_nnr = np.zeros(nj_cap)
-
-    # Body surface: arc-length uniform, tangent-based normals
-    ds = np.sqrt(np.diff(bx_b)**2 + np.diff(br_b)**2)
-    s  = np.concatenate([[0], np.cumsum(ds)])
-    su = np.linspace(0, s[-1], nj_body)
-    bx_s = np.interp(su, s, bx_b); br_s = np.interp(su, s, br_b)
-    tx = np.gradient(bx_s); tr = np.gradient(br_s)
-    mag = np.sqrt(tx**2 + tr**2) + 1e-30; tx /= mag; tr /= mag
-    nx_b = -tr; nr_b = tx
-    if nr_b[nj_body // 2] < 0: nx_b = -nx_b; nr_b = -nr_b
-
-    # Tail cap: x=x_tail, r: br_b[-1]->0, normal=(+1,0)
-    seg_tx  = np.full(nj_cap, bx_b[-1])
-    seg_tr  = np.linspace(br_b[-1], 0., nj_cap)
-    seg_tnx = np.full(nj_cap, 1.); seg_tnr = np.zeros(nj_cap)
-
-    # Combine
-    all_x  = np.concatenate([seg_nx,   bx_s[1:-1],  seg_tx])
-    all_r  = np.concatenate([seg_nr,   br_s[1:-1],  seg_tr])
-    all_nx = np.concatenate([seg_nnx,  nx_b[1:-1],  seg_tnx])
-    all_nr = np.concatenate([seg_nnr,  nr_b[1:-1],  seg_tnr])
-    Nj = len(all_x)
-
-    # Global smooth: blends cap<->body transitions
-    print(f"[Inflate] Smoothing normals ({smooth_iter} iter)...")
-    for _ in range(smooth_iter):
-        nxn = all_nx.copy(); nrn = all_nr.copy()
-        nxn[1:-1] = 0.05*all_nx[:-2] + 0.9*all_nx[1:-1] + 0.05*all_nx[2:]
-        nrn[1:-1] = 0.05*all_nr[:-2] + 0.9*all_nr[1:-1] + 0.05*all_nr[2:]
-        all_nx = nxn; all_nr = nrn
-        m = np.sqrt(all_nx**2 + all_nr**2) + 1e-30
-        all_nx /= m; all_nr /= m
-    all_nx[0] = -1.; all_nr[0] = 0.   # nose bottom: upstream
-    all_nx[-1] = 1.; all_nr[-1] = 0.  # tail bottom: downstream
-
-    # Extrude
-    XI = all_x[None, :] + eta[:, None] * all_nx[None, :]
-    RI = all_r[None, :] + eta[:, None] * all_nr[None, :]
-    RI = np.maximum(RI, 0.)
-
-    # Quality
-    dxi=XI[1:,:-1]-XI[:-1,:-1]; dri=RI[1:,:-1]-RI[:-1,:-1]
-    dxj=XI[:-1,1:]-XI[:-1,:-1]; drj=RI[:-1,1:]-RI[:-1,:-1]
-    area = np.abs(dxi*drj - dri*dxj)
-    asp  = (np.maximum(np.sqrt(dxi**2+dri**2), np.sqrt(dxj**2+drj**2)) /
-            (np.minimum(np.sqrt(dxi**2+dri**2), np.sqrt(dxj**2+drj**2)) + 1e-30))
-    neg    = int((area <= 0).sum())
-    r_at   = np.interp(XI[1:,:], bx_b, br_b, left=0., right=0.)
-    in_x   = (XI[1:,:] >= bx_b[0]) & (XI[1:,:] <= bx_b[-1])
-    inside = int((in_x & (RI[1:,:] < r_at * 0.98)).sum())
-    fa     = asp[np.isfinite(asp)]
-    print(f"[Inflate] Nj={Nj} | neg={neg} | inside={inside} | "
-          f"p99={np.percentile(fa,99):.0f} | cells={len(eta)*Nj:,}")
-    return XI, RI, eta, d_inf, Nj
+def is_transonic(mach):
+    return 0.8 <= mach <= 1.2
 
 
-def build_cartesian(bx_b, br_b, d_inf, x_up, x_dn, r_far, L, R_max):
-    dx_med   = L / 60
-    x_fine_l = bx_b[0]  - 2.0 * L
-    x_fine_r = bx_b[-1] + 3.0 * L
+def inflation_params(pts, mach, h0_ratio=0.005, gr=1.1):
+    R = pts[:, 1].max()
+    rf = 1.0
+    if is_transonic(mach):
+        t = (mach - 1.0) / 0.2
+        rf = 0.65 - 0.15 * 0.5 * (1.0 + math.cos(math.pi * t))
 
-    def stretch(x0, x1, dx0, ratio=1.08, dx_max=L*0.4):
-        pts = [x0]; dx = dx0; sign = 1 if x1 > x0 else -1
-        while sign * (x1 - pts[-1]) > 1e-9:
-            step = min(dx, abs(x1 - pts[-1]))
-            pts.append(pts[-1] + sign * step)
-            dx = min(dx * ratio, dx_max)
-        return np.array(pts)
-
-    x_far_up = stretch(x_fine_l, x_up, dx_med*2)[::-1]
-    x_med_up = np.linspace(x_fine_l, bx_b[0],
-                           max(3, int((bx_b[0]-x_fine_l)/dx_med)+2))
-    x_fine   = np.linspace(bx_b[0], bx_b[-1], 401)
-    x_med_dn = np.linspace(bx_b[-1], x_fine_r,
-                           max(3, int((x_fine_r-bx_b[-1])/dx_med)+2))
-    x_far_dn = stretch(x_fine_r, x_dn, dx_med*2, 1.08, L*0.5)
-    x_bg = np.unique(np.concatenate([x_far_up, x_med_up, x_fine,
-                                     x_med_dn, x_far_dn]))
-
-    r_bg = [d_inf]; dr = d_inf * 0.5
-    while r_bg[-1] < r_far:
-        r_bg.append(r_bg[-1] + dr); dr = min(dr*1.15, R_max)
-    r_bg.append(r_far)
-    r_bg = np.unique(np.concatenate([[0., d_inf*0.5], np.array(r_bg)]))
-
-    Nx = len(x_bg); Nr = len(r_bg)
-    XX, RR = np.meshgrid(x_bg, r_bg, indexing='ij')
-    r_body  = np.interp(x_bg, bx_b, br_b, left=0., right=0.)
-    is_solid = ((RR < r_body[:, None]) &
-                (XX >= bx_b[0]) & (XX <= bx_b[-1]))
-    n_fluid = int((~is_solid[:-1,:-1]).sum())
-    print(f"[Cartesian] Nx={Nx} Nr={Nr} | x=[{x_bg[0]:.1f},{x_bg[-1]:.1f}]m | "
-          f"r=[0,{r_bg[-1]:.2f}]m | fluid_cells={n_fluid:,}")
-    return x_bg, r_bg, is_solid
+    h0 = h0_ratio * R * rf
+    t_bl = R
+    n = max(25, math.ceil(math.log(t_bl * (gr - 1.0) / h0 + 1.0) / math.log(gr)))
+    t_actual = h0 * (gr**n - 1.0) / (gr - 1.0)
+    print(
+        f"  inflation: h0={h0:.5f}m ({h0 / R * 100:.3f}%R)  gr={gr}  "
+        f"n={n}  t={t_actual:.4f}m ({t_actual / R * 100:.1f}%R)"
+    )
+    return {"h0": h0, "gr": gr, "n": n, "t": t_actual, "rf": rf}
 
 
-def plot_mesh(XI, RI, x_bg, r_bg, bx_b, br_b, bx_all, br_all,
-              eta, d_inf, neg, inside, first_cell, growth, title, save_path):
-    Ni, Nj = XI.shape
-    L = bx_b.max()-bx_b.min(); R_max = br_b.max()
-    Nx = len(x_bg); x_up=x_bg[0]; x_dn=x_bg[-1]; r_far=r_bg[-1]
+def smooth_polyline(points, passes=20, weight_center=0.8):
+    """Lightly smooth a polyline without moving endpoints."""
+    if len(points) <= 2:
+        return points
 
-    fig = plt.figure(figsize=(24, 20))
-    gs  = fig.add_gridspec(3, 2, hspace=0.42, wspace=0.32)
-
-    def lcp(ax, X, R, si, sj, col='b', lw=0.3, al=0.7, mirror=False):
-        ni_, nj_ = X.shape
-        segs = ([list(zip(X[i,:],R[i,:])) for i in range(0,ni_,si)] +
-                [list(zip(X[:,j],R[:,j])) for j in range(0,nj_,sj)])
-        ax.add_collection(LineCollection(segs, colors=col, lw=lw, alpha=al))
-        if mirror:
-            segsm = ([list(zip(X[i,:],-R[i,:])) for i in range(0,ni_,si)] +
-                     [list(zip(X[:,j],-R[:,j])) for j in range(0,nj_,sj)])
-            ax.add_collection(LineCollection(segsm, colors=col, lw=lw, alpha=al))
-
-    def bgd(ax, xb, rb, sx=1, sr=1, r_max=None, col='c', lw=0.3, al=0.5, mirror=False):
-        rl = rb[rb <= (r_max if r_max else rb[-1])]
-        if len(rl) < 2: return
-        segs = ([([(xi,0),(xi,rl[-1])]) for xi in xb[::sx]] +
-                [([(xb[0],ri),(xb[-1],ri)]) for ri in rl[::sr]])
-        ax.add_collection(LineCollection(segs, colors=col, lw=lw, alpha=al))
-        if mirror:
-            segsm = ([([(xi,0),(xi,-rl[-1])]) for xi in xb[::sx]] +
-                     [([(xb[0],-ri),(xb[-1],-ri)]) for ri in rl[::sr]])
-            ax.add_collection(LineCollection(segsm, colors=col, lw=lw, alpha=al))
-
-    # P1: Full domain
-    ax1 = fig.add_subplot(gs[0,:])
-    bgd(ax1, x_bg, r_bg, sx=max(1,Nx//100), sr=1, lw=0.25, al=0.5)
-    lcp(ax1, XI, RI, max(1,Ni//5), max(1,Nj//50), lw=0.4, al=0.85)
-    ax1.fill_between(bx_all, 0, br_all, color='dimgray', alpha=0.95, label='Body')
-    ax1.plot(bx_all, br_all, 'r-', lw=2)
-    ax1.axhline(0, color='k', lw=1., ls='--', alpha=0.6, label='Sym. axis')
-    ax1.set_xlim(x_up, x_dn); ax1.set_ylim(0, r_far)
-    ax1.set_xlabel('x [m]',fontsize=12); ax1.set_ylabel('r [m]',fontsize=12)
-    ax1.set_title(f'Full domain | neg={neg} inside={inside}', fontsize=11)
-    ax1.legend(fontsize=9)
-
-    # P2: Nose zoom
-    ax2 = fig.add_subplot(gs[1,0])
-    xz = bx_b[0]+L*0.25; rz = R_max*4.
-    xbz = x_bg[(x_bg>=bx_b[0]-L*0.18)&(x_bg<=xz)]
-    bgd(ax2, xbz, r_bg, sx=1, sr=1, r_max=rz, lw=0.5, al=0.6)
-    lcp(ax2, XI, RI, 1, max(1,Nj//60), lw=0.5, al=0.9)
-    ax2.fill_between(bx_all, 0, br_all, color='dimgray', alpha=0.95)
-    ax2.plot(bx_all, br_all, 'r-', lw=2)
-    ax2.axhline(0, color='k', lw=0.8, ls='--', alpha=0.5)
-    ax2.set_xlim(bx_b[0]-L*0.18, xz); ax2.set_ylim(0, rz); ax2.autoscale_view()
-    ax2.set_xlabel('x [m]',fontsize=11); ax2.set_ylabel('r [m]',fontsize=11)
-    ax2.set_title('Nose region', fontsize=11); ax2.grid(True, alpha=0.2)
-
-    # P3: Tail zoom
-    ax3 = fig.add_subplot(gs[1,1])
-    xzl=bx_b[-1]-L*0.25; xzr=bx_b[-1]+L*0.8; rz=R_max*4.
-    xbz = x_bg[(x_bg>=xzl)&(x_bg<=xzr)]
-    bgd(ax3, xbz, r_bg, sx=1, sr=1, r_max=rz, lw=0.5, al=0.6)
-    lcp(ax3, XI, RI, 1, max(1,Nj//60), lw=0.5, al=0.9)
-    ax3.fill_between(bx_all, 0, br_all, color='dimgray', alpha=0.95)
-    ax3.plot(bx_all, br_all, 'r-', lw=2)
-    ax3.axhline(0, color='k', lw=0.8, ls='--', alpha=0.5)
-    ax3.set_xlim(xzl, xzr); ax3.set_ylim(0, rz); ax3.autoscale_view()
-    ax3.set_xlabel('x [m]',fontsize=11); ax3.set_ylabel('r [m]',fontsize=11)
-    ax3.set_title('Tail region', fontsize=11); ax3.grid(True, alpha=0.2)
-
-    # P4: Mid-body inflation detail
-    ax4 = fig.add_subplot(gs[2,:])
-    x_mid=bx_b[0]+L*0.5; dxw=L*0.12
-    r_bm=float(np.interp(x_mid, bx_b, br_b))
-    j_mask=(XI[0,:]>=x_mid-dxw)&(XI[0,:]<=x_mid+dxw)
-    if j_mask.sum() > 0:
-        Xi=XI[:,j_mask]; Ri=RI[:,j_mask]
-        segs=([list(zip(Xi[i,:],Ri[i,:])) for i in range(Ni)] +
-              [list(zip(Xi[:,j],Ri[:,j]))
-               for j in range(0,Xi.shape[1],max(1,Xi.shape[1]//80))])
-        ax4.add_collection(LineCollection(segs, colors='b', lw=0.7, alpha=0.9))
-    xbz=x_bg[(x_bg>=x_mid-dxw)&(x_bg<=x_mid+dxw)]
-    r_top=r_bm+d_inf*1.3
-    bgd(ax4, xbz, r_bg, sx=1, sr=1, r_max=r_top, lw=0.6, al=0.7)
-    bx_m=bx_b[(bx_b>=x_mid-dxw)&(bx_b<=x_mid+dxw)]
-    br_m=br_b[(bx_b>=x_mid-dxw)&(bx_b<=x_mid+dxw)]
-    ax4.fill_between(bx_m, 0, br_m, color='dimgray', alpha=0.95)
-    ax4.plot(bx_m, br_m, 'r-', lw=2)
-    ax4.axhline(0, color='k', lw=0.8, ls='--', alpha=0.5)
-    ax4.set_xlim(x_mid-dxw, x_mid+dxw); ax4.set_ylim(r_bm*0.80, r_top)
-    ax4.autoscale_view()
-    ax4.set_xlabel('x [m]',fontsize=11); ax4.set_ylabel('r [m]',fontsize=11)
-    ax4.set_title(f'Mid-body inflation | '
-                  f'first={first_cell:.1e}m  growth={growth}  '
-                  f'thickness={d_inf:.4f}m  ({Ni-1} layers)', fontsize=11)
-    ax4.grid(True, alpha=0.2)
-
-    fig.suptitle(title, fontsize=12)
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    print(f"[Plot]   -> {save_path}")
-    plt.close('all')
+    points = points.copy()
+    w_side = 0.5 * (1.0 - weight_center)
+    for _ in range(passes):
+        points[1:-1] = (
+            w_side * points[:-2]
+            + weight_center * points[1:-1]
+            + w_side * points[2:]
+        )
+    return points
 
 
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument('--profile',          required=True)
-    p.add_argument('--first_cell',       type=float, default=5e-5)
-    p.add_argument('--growth',           type=float, default=1.1)
-    p.add_argument('--target_thickness', type=float, default=None)
-    p.add_argument('--n_inf',            type=int,   default=None)
-    p.add_argument('--nj_body',          type=int,   default=500)
-    p.add_argument('--nj_cap',           type=int,   default=60)
-    p.add_argument('--smooth_iter',      type=int,   default=3000)
-    p.add_argument('--r_far',            type=float, default=None)
-    p.add_argument('--x_up_mult',        type=float, default=5.0)
-    p.add_argument('--x_dn_mult',        type=float, default=15.0)
-    p.add_argument('--supersonic',       action='store_true')
-    p.add_argument('--output',           default=None)
-    return p.parse_args()
+def build_inflation(pts, infl):
+    """
+    Create inflation layers by offsetting the body profile along smoothed normals.
+    The method stays explicit and geometric; only implementation details are improved.
+    """
+    N = len(pts)
+    h0 = infl["h0"]
+    gr = infl["gr"]
+    n = infl["n"]
+
+    tx = np.gradient(pts[:, 0])
+    tr = np.gradient(pts[:, 1])
+    mag = np.sqrt(tx**2 + tr**2) + 1e-30
+    nx = tr / mag
+    nr = -tx / mag
+    if nr.mean() < 0.0:
+        nx = -nx
+        nr = -nr
+
+    x_nose = pts[:, 0].min()
+    x_tail = pts[:, 0].max()
+    zero_mask = pts[:, 1] < 1e-8
+    nose_mask = zero_mask & (pts[:, 0] <= x_nose + 1e-6)
+    tail_mask = zero_mask & (pts[:, 0] >= x_tail - 1e-6)
+    mid_mask = zero_mask & ~nose_mask & ~tail_mask
+
+    nx[nose_mask] = -1.0
+    nr[nose_mask] = 0.0
+    nx[tail_mask] = 1.0
+    nr[tail_mask] = 0.0
+    nx[mid_mask] = 0.0
+    nr[mid_mask] = 1.0
+
+    for _ in range(200):
+        nx_s = nx.copy()
+        nr_s = nr.copy()
+        nx_s[1:-1] = 0.15 * nx[:-2] + 0.70 * nx[1:-1] + 0.15 * nx[2:]
+        nr_s[1:-1] = 0.15 * nr[:-2] + 0.70 * nr[1:-1] + 0.15 * nr[2:]
+        nx_s[nose_mask] = -1.0
+        nr_s[nose_mask] = 0.0
+        nx_s[tail_mask] = 1.0
+        nr_s[tail_mask] = 0.0
+        nx_s[mid_mask] = 0.0
+        nr_s[mid_mask] = 1.0
+        m = np.sqrt(nx_s**2 + nr_s**2) + 1e-30
+        nx = nx_s / m
+        nr = nr_s / m
+
+    distances = h0 * (gr ** np.arange(1, n + 1) - 1.0) / (gr - 1.0)
+    normals = np.stack((nx, nr), axis=1)
+
+    layers = np.zeros((n + 1, N, 2), dtype=np.float64)
+    layers[0] = pts
+    for k, d in enumerate(distances, start=1):
+        raw = pts + d * normals
+        raw[:, 1] = np.maximum(raw[:, 1], 0.0)
+        raw = smooth_polyline(raw, passes=20, weight_center=0.8)
+        raw[:, 1] = np.maximum(raw[:, 1], 0.0)
+        raw[0] = pts[0] + d * normals[0]
+        raw[-1] = pts[-1] + d * normals[-1]
+        raw[0, 1] = max(raw[0, 1], 0.0)
+        raw[-1, 1] = max(raw[-1, 1], 0.0)
+        layers[k] = raw
+
+    print(f"  inflation layers built: {n} x {N} points")
+    return layers, normals
+
+
+def build_outer_mesh(pts, layers, dom, infl, h_far_ratio, out_msh, preview):
+    """
+    Generate the outer Delaunay mesh in Gmsh around the last inflation layer.
+    """
+    gmsh.initialize()
+    gmsh.model.add("outer")
+    geo = gmsh.model.geo
+
+    R = dom["R"]
+    x_in = dom["x_in"]
+    x_out = dom["x_out"]
+    r_far = dom["r_far"]
+    x0 = dom["x0"]
+    x1 = dom["x1"]
+
+    h_far = h_far_ratio * R
+    h_last = infl["h0"] * infl["gr"] ** (infl["n"] - 1)
+    h_tr = h_last * 2.0
+
+    outer_layer = layers[-1]
+    N = len(outer_layer)
+    outer_tags = [geo.addPoint(x, r, 0.0, meshSize=h_tr) for x, r in outer_layer]
+    outer_curves = [geo.addLine(outer_tags[i], outer_tags[i + 1]) for i in range(N - 1)]
+
+    p_in_ax = geo.addPoint(x_in, 0.0, 0.0, meshSize=h_far)
+    p_out_ax = geo.addPoint(x_out, 0.0, 0.0, meshSize=h_far)
+    p_in_top = geo.addPoint(x_in, r_far, 0.0, meshSize=h_far)
+    p_out_top = geo.addPoint(x_out, r_far, 0.0, meshSize=h_far)
+    p_nose_top = geo.addPoint(x0, r_far, 0.0, meshSize=h_far)
+    p_base_top = geo.addPoint(x1, r_far, 0.0, meshSize=h_far)
+
+    p_ol_nose = outer_tags[0]
+    p_ol_base = outer_tags[-1]
+
+    l_ax_in = geo.addLine(p_in_ax, p_ol_nose)
+    l_ax_out = geo.addLine(p_ol_base, p_out_ax)
+    l_inlet = geo.addLine(p_in_ax, p_in_top)
+    l_outlet = geo.addLine(p_out_top, p_out_ax)
+    l_far_1 = geo.addLine(p_in_top, p_nose_top)
+    l_far_2 = geo.addLine(p_nose_top, p_base_top)
+    l_far_3 = geo.addLine(p_base_top, p_out_top)
+    l_v_nose = geo.addLine(p_ol_nose, p_nose_top)
+    l_v_base = geo.addLine(p_ol_base, p_base_top)
+
+    lp1 = geo.addCurveLoop([-l_ax_in, l_inlet, l_far_1, -l_v_nose])
+    s1 = geo.addPlaneSurface([lp1])
+
+    mid = [l_v_nose, l_far_2, -l_v_base, *[-c for c in reversed(outer_curves)]]
+    lp2 = geo.addCurveLoop(mid)
+    s2 = geo.addPlaneSurface([lp2])
+
+    lp3 = geo.addCurveLoop([l_v_base, l_far_3, l_outlet, -l_ax_out])
+    s3 = geo.addPlaneSurface([lp3])
+
+    geo.synchronize()
+
+    gmsh.model.addPhysicalGroup(1, outer_curves, tag=1, name="bl_outer")
+    gmsh.model.addPhysicalGroup(1, [l_ax_in, l_ax_out], tag=2, name="axis")
+    gmsh.model.addPhysicalGroup(1, [l_inlet], tag=3, name="inlet")
+    gmsh.model.addPhysicalGroup(1, [l_outlet], tag=4, name="outlet")
+    gmsh.model.addPhysicalGroup(1, [l_far_1, l_far_2, l_far_3], tag=5, name="farfield")
+    gmsh.model.addPhysicalGroup(2, [s1, s2, s3], tag=10, name="fluid")
+
+    h_mid = h_tr * 8.0
+    h_far_eff = max(h_far, h_mid * 2.5)
+
+    f_dist = gmsh.model.mesh.field.add("Distance")
+    gmsh.model.mesh.field.setNumbers(f_dist, "CurvesList", outer_curves)
+    gmsh.model.mesh.field.setNumber(f_dist, "Sampling", max(200, min(2000, 2 * N)))
+
+    f_thr1 = gmsh.model.mesh.field.add("Threshold")
+    gmsh.model.mesh.field.setNumber(f_thr1, "InField", f_dist)
+    gmsh.model.mesh.field.setNumber(f_thr1, "SizeMin", h_tr)
+    gmsh.model.mesh.field.setNumber(f_thr1, "SizeMax", h_mid)
+    gmsh.model.mesh.field.setNumber(f_thr1, "DistMin", 0.0)
+    gmsh.model.mesh.field.setNumber(f_thr1, "DistMax", R * 5.0)
+
+    f_thr2 = gmsh.model.mesh.field.add("Threshold")
+    gmsh.model.mesh.field.setNumber(f_thr2, "InField", f_dist)
+    gmsh.model.mesh.field.setNumber(f_thr2, "SizeMin", h_mid)
+    gmsh.model.mesh.field.setNumber(f_thr2, "SizeMax", h_far_eff)
+    gmsh.model.mesh.field.setNumber(f_thr2, "DistMin", R * 5.0)
+    gmsh.model.mesh.field.setNumber(f_thr2, "DistMax", R * 40.0)
+
+    f_box = gmsh.model.mesh.field.add("Box")
+    gmsh.model.mesh.field.setNumber(f_box, "VIn", h_mid)
+    gmsh.model.mesh.field.setNumber(f_box, "VOut", h_far_eff)
+    gmsh.model.mesh.field.setNumber(f_box, "XMin", dom["x0"] - 1.5 * dom["L"])
+    gmsh.model.mesh.field.setNumber(f_box, "XMax", dom["x1"] + 2.5 * dom["L"])
+    gmsh.model.mesh.field.setNumber(f_box, "YMin", 0.0)
+    gmsh.model.mesh.field.setNumber(f_box, "YMax", min(dom["r_far"], max(6.0 * R, 2.5 * infl["t"])))
+    gmsh.model.mesh.field.setNumber(f_box, "Thickness", max(0.5 * R, infl["t"]))
+
+    f_min = gmsh.model.mesh.field.add("Min")
+    gmsh.model.mesh.field.setNumbers(f_min, "FieldsList", [f_thr1, f_thr2, f_box])
+    gmsh.model.mesh.field.setAsBackgroundMesh(f_min)
+
+    gmsh.option.setNumber("Mesh.Algorithm", 5)
+    gmsh.option.setNumber("Mesh.Smoothing", 3)
+    gmsh.option.setNumber("Mesh.MinimumCurveNodes", 5)
+    gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
+    gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
+    gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 1)
+
+    print("  [Gmsh] generating outer Delaunay mesh...")
+    print(f"         h_tr={h_tr:.5f}m  h_mid={h_mid:.4f}m  h_far={h_far_eff:.4f}m")
+    gmsh.model.mesh.generate(2)
+
+    node_tags, _, _ = gmsh.model.mesh.getNodes()
+    elem_types, elem_tags, _ = gmsh.model.mesh.getElements(dim=2)
+    n_elems = sum(len(tags) for tags in elem_tags)
+    print(f"  [Gmsh] nodes={len(node_tags):,}  elems={n_elems:,}  types={elem_types}")
+
+    gmsh.write(out_msh)
+    if preview:
+        gmsh.fltk.run()
+    gmsh.finalize()
+
+
+def assemble_npz(pts, layers, infl, msh_path, out_npz):
+    """Combine inflation quads and outer Gmsh triangles into one NPZ dataset."""
+    n_lay = infl["n"]
+    N = len(pts)
+
+    bl_nodes = layers.reshape(-1, 2)
+
+    k_idx = np.arange(n_lay, dtype=np.int32)[:, None]
+    i_idx = np.arange(N - 1, dtype=np.int32)[None, :]
+    base = (k_idx * N + i_idx).reshape(-1)
+    bl_cells = np.column_stack((base, base + 1, base + N + 1, base + N)).astype(np.int32)
+    n_bl = len(bl_nodes)
+
+    gmsh.initialize()
+    gmsh.open(msh_path)
+
+    node_tags, coords, _ = gmsh.model.mesh.getNodes()
+    coords = coords.reshape(-1, 3)
+    t2i = {tag: i for i, tag in enumerate(node_tags)}
+    ext_nodes = coords[:, :2].astype(np.float64)
+
+    try:
+        elem_tags, elem_nodes = gmsh.model.mesh.getElementsByType(2)
+        del elem_tags
+        tri_conn = elem_nodes.reshape(-1, 3)
+        flat = np.fromiter((t2i[tag] for tag in tri_conn.ravel()), dtype=np.int32)
+        tri_cells = flat.reshape(-1, 3)[:, ::-1]
+    except Exception:
+        tri_cells = np.empty((0, 3), dtype=np.int32)
+
+    face_coords = []
+    face_tags = []
+    for ptag in (1, 2, 3, 4, 5):
+        try:
+            ents = gmsh.model.getEntitiesForPhysicalGroup(1, ptag)
+        except Exception:
+            continue
+        for ent in ents:
+            try:
+                _, _, elem_node_sets = gmsh.model.mesh.getElements(1, ent)
+            except Exception:
+                continue
+            for elem_nodes in elem_node_sets:
+                pairs = elem_nodes.reshape(-1, 2)
+                coords_pair = np.array(
+                    [[ext_nodes[t2i[a]], ext_nodes[t2i[b]]] for a, b in pairs],
+                    dtype=np.float64,
+                )
+                face_coords.append(coords_pair)
+                face_tags.append(np.full(len(coords_pair), ptag, dtype=np.int8))
+
+    gmsh.finalize()
+
+    if len(tri_cells):
+        tri_cells = tri_cells + n_bl
+
+    all_nodes = np.vstack((bl_nodes, ext_nodes))
+
+    if face_coords:
+        face_coords = np.vstack(face_coords)
+        face_tags = np.concatenate(face_tags)
+    else:
+        face_coords = np.empty((0, 2, 2), dtype=np.float64)
+        face_tags = np.empty((0,), dtype=np.int8)
+
+    body_arr = np.stack((bl_nodes[: N - 1], bl_nodes[1:N]), axis=1)
+    body_tag = np.ones(len(body_arr), dtype=np.int8)
+    face_coords = np.vstack((body_arr, face_coords))
+    face_tags = np.concatenate((body_tag, face_tags))
+
+    np.savez_compressed(
+        out_npz,
+        nodes=all_nodes.astype(np.float64),
+        quad_cells=bl_cells,
+        tri_cells=tri_cells,
+        face_nodes=face_coords,
+        face_tag=face_tags,
+        bl_first_h=np.float64(infl["h0"]),
+        bl_layers=np.int32(infl["n"]),
+        bl_growth=np.float64(infl["gr"]),
+    )
+    print(f"  [NPZ] {out_npz}")
+    print(
+        f"        all nodes={len(all_nodes):,}  "
+        f"quad(inflation)={len(bl_cells):,}  tri(outer)={len(tri_cells):,}"
+    )
+    tag_name = {1: "body", 2: "axis", 3: "inlet", 4: "outlet", 5: "farfield"}
+    for tag, name in tag_name.items():
+        print(f"        tag{tag}({name})={int((face_tags == tag).sum())}")
+
+
+def visualize(npz_path, out_png):
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.collections as mc
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("  pip install matplotlib required")
+        return
+
+    data = np.load(npz_path, allow_pickle=False)
+    nodes = data["nodes"]
+    quads = data["quad_cells"]
+    tris = data["tri_cells"]
+    face_tag = data["face_tag"]
+    face_nodes = data["face_nodes"]
+
+    fig, axes = plt.subplots(1, 2, figsize=(20, 8), facecolor="#0d1117")
+    tag_color = {1: "#ff4c4c", 2: "#3a8fff", 3: "#44ff88", 4: "#ffaa00", 5: "#cc44ff"}
+    tag_label = {1: "body", 2: "axis", 3: "inlet", 4: "outlet", 5: "farfield"}
+
+    body_segments = face_nodes[face_tag == 1]
+    bx = body_segments[:, :, 0]
+    br = body_segments[:, :, 1]
+    x0 = bx.min()
+    x1 = bx.max()
+    rmax = br.max()
+
+    def draw(ax, xl, xr, rl, rr, maxc=60000):
+        for cells, ncorner in ((quads, 4), (tris, 3)):
+            if not len(cells):
+                continue
+            c0 = nodes[cells[:, 0]]
+            mask = (c0[:, 0] >= xl) & (c0[:, 0] <= xr) & (c0[:, 1] >= rl) & (c0[:, 1] <= rr)
+            sub = cells[mask]
+            step = max(1, len(sub) // maxc)
+            segs = []
+            for cell in sub[::step]:
+                for k in range(ncorner):
+                    segs.append([nodes[cell[k]], nodes[cell[(k + 1) % ncorner]]])
+            if segs:
+                color = "#1e5a9a" if ncorner == 4 else "#2a6a3a"
+                ax.add_collection(mc.LineCollection(segs, colors=color, linewidths=0.2, alpha=0.8))
+
+    ax = axes[0]
+    ax.set_facecolor("#0d1117")
+    xl = x0 - rmax * 0.5
+    xr = x1 + rmax * 0.5
+    rl = 0.0
+    rr = rmax * 4.0
+    draw(ax, xl, xr, rl, rr)
+    for tag in (2, 1):
+        seg = face_nodes[face_tag == tag]
+        in_range = ((seg[:, :, 0] >= xl) & (seg[:, :, 0] <= xr)).any(axis=1)
+        if in_range.sum():
+            ax.add_collection(
+                mc.LineCollection(
+                    seg[in_range],
+                    colors=tag_color[tag],
+                    linewidths=2.0 if tag == 1 else 1.0,
+                    label=tag_label[tag],
+                )
+            )
+    ax.set_xlim(xl, xr)
+    ax.set_ylim(rl, rr)
+    ax.set_aspect("equal")
+    ax.set_title("Body + Inflation Layers", color="white", fontsize=12)
+    ax.set_xlabel("x [m]", color="#aaa")
+    ax.set_ylabel("r [m]", color="#aaa")
+    ax.tick_params(colors="#aaa")
+    ax.legend(facecolor="#1a1a2e", labelcolor="white", fontsize=8)
+
+    ax = axes[1]
+    ax.set_facecolor("#0d1117")
+    zr = rmax * 0.8
+    xl2 = x0 - zr * 0.15
+    xr2 = x0 + zr * 1.5
+    rl2 = 0.0
+    rr2 = zr
+    draw(ax, xl2, xr2, rl2, rr2, maxc=80000)
+    for tag in (2, 1):
+        seg = face_nodes[face_tag == tag]
+        in_range = ((seg[:, :, 0] >= xl2) & (seg[:, :, 0] <= xr2)).any(axis=1)
+        if in_range.sum():
+            ax.add_collection(
+                mc.LineCollection(
+                    seg[in_range],
+                    colors=tag_color[tag],
+                    linewidths=2.0 if tag == 1 else 1.0,
+                    label=tag_label[tag],
+                )
+            )
+    ax.set_xlim(xl2, xr2)
+    ax.set_ylim(rl2, rr2)
+    ax.set_aspect("equal")
+    ax.set_title("Nose Close-up (Inflation Layers)", color="white", fontsize=12)
+    ax.set_xlabel("x [m]", color="#aaa")
+    ax.set_ylabel("r [m]", color="#aaa")
+    ax.tick_params(colors="#aaa")
+    ax.legend(facecolor="#1a1a2e", labelcolor="white", fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close()
+    print(f"  [PNG] {out_png}")
 
 
 def main():
-    args = parse_args()
-    base   = os.path.splitext(os.path.basename(args.profile))[0].replace('_profile','')
-    outpfx = args.output or (base + '_mesh')
+    parser = argparse.ArgumentParser(
+        description="Hybrid mesh: NumPy inflation layers + Gmsh Delaunay outer mesh"
+    )
+    parser.add_argument("--profile", default="Falcon9_profile.csv")
+    parser.add_argument("--mach", type=float, default=2.0)
+    parser.add_argument("--h0ratio", type=float, default=0.005, help="h0 / R_ref")
+    parser.add_argument("--farfield", type=float, default=0.35, help="farfield mesh size / R_ref")
+    parser.add_argument("--out", default=None)
+    parser.add_argument("--preview", action="store_true")
+    args = parser.parse_args()
 
-    print("=" * 55)
-    print("  Inflation + Cartesian Mesh Generator")
-    print("=" * 55)
-    print(f"  Profile : {args.profile}")
-    print(f"  growth  : {args.growth}  first_cell : {args.first_cell:.1e}m")
-    print("=" * 55 + "\n")
+    workdir = os.path.dirname(os.path.abspath(__file__))
+    if args.out is None:
+        base_name = os.path.splitext(os.path.basename(args.profile))[0] + "_mesh"
+        args.out = os.path.join(workdir, base_name)
+    elif not os.path.isabs(args.out):
+        args.out = os.path.join(workdir, args.out)
 
-    bx_b, br_b, bx_all, br_all, L, R_max = load_profile(args.profile)
+    print(f"\n{'=' * 52}")
+    print(f"  Hybrid Mesh Generator  Mach={args.mach}  output:{args.out}")
+    if is_transonic(args.mach):
+        print("  transonic mode: first-layer height reduced automatically")
+    print(f"{'=' * 52}\n")
 
-    x_up_m = 10. if args.supersonic else args.x_up_mult
-    x_up   = bx_b[0]  - x_up_m * L
-    x_dn   = bx_b[-1] + args.x_dn_mult * L
-    r_far  = args.r_far or (20. * R_max)
-    print(f"[Domain] x=[{x_up:.1f},{x_dn:.1f}]m | r=[0,{r_far:.2f}]m\n")
+    print("[1/5] Load profile")
+    pts = load_profile(args.profile)
 
-    if args.n_inf is not None:
-        n_inf = args.n_inf
-        print(f"[Inflate] Fixed n_inf={n_inf}")
-    else:
-        target = args.target_thickness or R_max
-        n_inf  = compute_n_inf(args.first_cell, args.growth, target)
+    print("\n[2/5] Domain and inflation parameters")
+    dom = domain_params(pts, args.mach)
+    infl = inflation_params(pts, args.mach, h0_ratio=args.h0ratio)
 
-    XI, RI, eta, d_inf, Nj = build_inflation(
-        bx_b, br_b, args.first_cell, args.growth, n_inf,
-        args.nj_body, args.nj_cap, args.smooth_iter)
-    Ni = len(eta)
+    print("\n[3/5] Build inflation layers (NumPy)")
+    layers, _ = build_inflation(pts, infl)
 
-    print()
-    x_bg, r_bg, is_solid = build_cartesian(
-        bx_b, br_b, d_inf, x_up, x_dn, r_far, L, R_max)
+    msh = args.out + ".msh"
+    print("\n[4/5] Build outer Delaunay mesh (Gmsh)")
+    build_outer_mesh(pts, layers, dom, infl, args.farfield, msh, args.preview)
 
-    # Final quality
-    dxi=XI[1:,:-1]-XI[:-1,:-1]; dri=RI[1:,:-1]-RI[:-1,:-1]
-    dxj=XI[:-1,1:]-XI[:-1,:-1]; drj=RI[:-1,1:]-RI[:-1,:-1]
-    neg    = int((np.abs(dxi*drj-dri*dxj) <= 0).sum())
-    r_at   = np.interp(XI[1:,:], bx_b, br_b, left=0., right=0.)
-    in_x   = (XI[1:,:] >= bx_b[0]) & (XI[1:,:] <= bx_b[-1])
-    inside = int((in_x & (RI[1:,:] < r_at*0.98)).sum())
-    print(f"\n[Summary] inflation={Nj*(Ni-1):,}  "
-          f"bg_fluid={int((~is_solid[:-1,:-1]).sum()):,}  "
-          f"neg={neg}  inside={inside}")
+    npz = args.out + ".npz"
+    print("\n[5/5] Assemble NPZ and preview image")
+    assemble_npz(pts, layers, infl, msh, npz)
+    visualize(npz, args.out + "_preview.png")
 
-    np.savez_compressed(outpfx+'.npz',
-        XI=XI, RI=RI, x_bg=x_bg, r_bg=r_bg, is_solid=is_solid,
-        body_x=bx_b, body_r=br_b, eta=eta,
-        p_d_inf=np.array(d_inf), p_L=np.array(L), p_R_max=np.array(R_max),
-        p_x_up=np.array(x_up), p_x_dn=np.array(x_dn), p_r_far=np.array(r_far))
-    print(f"[Save]   -> {outpfx}.npz")
-
-    title = (f"{os.path.basename(args.profile)} | "
-             f"Inflation: {Ni-1}L  {d_inf:.4f}m | neg={neg}  inside={inside}")
-    plot_mesh(XI, RI, x_bg, r_bg, bx_b, br_b, bx_all, br_all,
-              eta, d_inf, neg, inside, args.first_cell, args.growth,
-              title, outpfx+'_mesh.png')
-
-    print(f"\n[Done]  {outpfx}.npz  |  {outpfx}_mesh.png")
+    print("\nOutput files:")
+    print(f"  {msh}")
+    print(f"  {npz}")
+    print(f"  {args.out}_preview.png")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
