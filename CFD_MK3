@@ -1,0 +1,1651 @@
+"""
+================================================================================
+ 발사체 CFD 시뮬레이터 (NPZ Mesh + Compressible RANS + AUSM+ + LU-SGS)
+================================================================================
+ 입력:
+   - 1.mesh.py가 생성한 hybrid mesh NPZ
+ 출력:
+   - Streamlit 기반 형상/계수/유동장/잔차 시각화
+
+ 핵심 수치 기법:
+   - 지배방정식: 2D axisymmetric compressible RANS (cell-centered FVM)
+   - 난류모델: k-omega SST (Menter-style blended constants)
+   - 대류항: AUSM+ flux splitting
+   - 점성항: Green-Gauss gradient + central viscous flux
+   - 시간적분: pseudo-time LU-SGS
+
+ 주의:
+   - 입력 메쉬는 1.mesh.py의 최신 NPZ 포맷(nodes/quad_cells/tri_cells/face_nodes/face_tag)에 맞춥니다.
+   - 본 구현은 Streamlit 대화형 사용성을 유지하기 위해 축대칭 혼합 격자 위에서
+     실용적인 저차 RANS 구조를 우선 제공합니다.
+   - 축대칭 모델 특성상 받음각 3D 비대칭 효과는 직접 해석하지 못하므로,
+     CN/Cm은 축방향 해석 결과와 slender-body proxy를 함께 사용한 지표입니다.
+================================================================================
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+
+GAMMA = 1.4
+R_AIR = 287.058
+PR_LAM = 0.72
+PR_T = 0.90
+EPS = 1e-12
+
+
+st.set_page_config(
+    page_title="발사체 CFD 시뮬레이터",
+    page_icon="🚀",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(
+    """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@400;600;700&display=swap');
+html, body, [class*="css"] {
+    font-family: 'Rajdhani', sans-serif;
+    background-color: #050A14;
+    color: #C8D8E8;
+}
+h1, h2, h3 {
+    font-family: 'Share Tech Mono', monospace;
+    color: #4FC3F7;
+}
+.stSidebar {
+    background-color: #080F1E !important;
+    border-right: 1px solid #1A2A3A;
+}
+.metric-card {
+    background: linear-gradient(135deg, #0D1B2A, #1A2744);
+    border: 1px solid #2A4A6A;
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin: 6px 0;
+}
+.metric-card .label {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 11px;
+    color: #7AB3CC;
+    letter-spacing: 1.2px;
+    text-transform: uppercase;
+}
+.metric-card .value {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 22px;
+    color: #E0F4FF;
+    font-weight: bold;
+}
+.section-header {
+    font-family: 'Share Tech Mono', monospace;
+    color: #29B6F6;
+    font-size: 13px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    border-bottom: 1px solid #1A3A5A;
+    padding-bottom: 4px;
+    margin: 20px 0 10px 0;
+}
+.warning-box {
+    background-color: #101b25;
+    border-left: 3px solid #4FC3F7;
+    padding: 10px 14px;
+    border-radius: 4px;
+    font-size: 13px;
+    color: #AED8F0;
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+
+@dataclass
+class MeshCase:
+    name: str
+    path: str
+    color: str
+
+
+@dataclass
+class MeshData:
+    name: str
+    path: str
+    nodes: np.ndarray
+    cell_nodes: List[np.ndarray]
+    cell_types: np.ndarray
+    cell_centers: np.ndarray
+    cell_area: np.ndarray
+    cell_volume: np.ndarray
+    cell_orientation: np.ndarray
+    faces_left: np.ndarray
+    faces_right: np.ndarray
+    face_node_a: np.ndarray
+    face_node_b: np.ndarray
+    face_center: np.ndarray
+    face_normal: np.ndarray
+    face_length: np.ndarray
+    face_area: np.ndarray
+    face_tag: np.ndarray
+    cell_faces: List[List[int]]
+    wall_distance: np.ndarray
+    profile_x: np.ndarray
+    profile_r: np.ndarray
+    r_ref: float
+    length_ref: float
+    ref_area: float
+    body_segments: np.ndarray
+
+
+@dataclass
+class SolverConfig:
+    mach: float
+    altitude: float
+    cfl: float = 0.2
+    max_iter: int = 20
+    tol: float = 1e-5
+    h0_ratio: float = 0.005
+    turbulence_intensity: float = 0.01
+    turb_visc_ratio: float = 10.0
+    alpha_proxy_deg: float = 5.0
+    farfield_pressure_relax: float = 1.0
+
+
+@dataclass
+class SolverResult:
+    U: np.ndarray
+    primitive: Dict[str, np.ndarray]
+    residual_history: List[float]
+    runtime_s: float
+    coeffs: Dict[str, float]
+    mesh_points: int
+    n_cells: int
+    n_faces: int
+
+
+def estimate_runtime_seconds(n_cells: int, max_iter: int, n_mach: int, n_cases: int) -> float:
+    # Empirical first-pass estimate from local Python implementation on current mesh scale.
+    sec_per_cell_iter = 3.4e-4
+    single = n_cells * max_iter * sec_per_cell_iter
+    sweep_factor = max(1, n_mach)
+    return n_cases * (single + 0.6 * single * sweep_factor / max(max_iter, 1))
+
+
+def metric_card(col, label: str, value: str, unit: str = ""):
+    col.markdown(
+        f"""
+        <div class="metric-card">
+          <div class="label">{label}</div>
+          <div class="value">{value}<span style="font-size:12px; color:#7AB3CC"> {unit}</span></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def isa_atmosphere(altitude_m: float) -> Dict[str, float]:
+    g0 = 9.80665
+    T0 = 288.15
+    P0 = 101325.0
+    h = float(altitude_m)
+
+    if h < 11000.0:
+        lapse = -0.0065
+        T = T0 + lapse * h
+        P = P0 * (T / T0) ** (-g0 / (R_AIR * lapse))
+    elif h < 20000.0:
+        T = 216.65
+        P11 = P0 * (216.65 / T0) ** (-g0 / (R_AIR * (-0.0065)))
+        P = P11 * np.exp(-g0 * (h - 11000.0) / (R_AIR * T))
+    else:
+        T = 216.65 + 0.001 * (h - 20000.0)
+        T11 = 216.65
+        P11 = P0 * (T11 / T0) ** (-g0 / (R_AIR * (-0.0065)))
+        P20 = P11 * np.exp(-g0 * 9000.0 / (R_AIR * T11))
+        P = P20 * (T / T11) ** (-g0 / (R_AIR * 0.001))
+
+    rho = P / (R_AIR * T)
+    a = math.sqrt(GAMMA * R_AIR * T)
+    mu = 1.458e-6 * T**1.5 / (T + 110.4)
+    return {"T": T, "P": P, "rho": rho, "a": a, "mu": mu}
+
+
+def classify_mesh_case(filename: str) -> Tuple[str | None, str]:
+    low = filename.lower()
+    if "nuri" in low:
+        return "누리호 (KSLV-II)", "#29B6F6"
+    if "taurus" in low or "hammerhead" in low:
+        return "타우러스 2210", "#FF7043"
+    if "falcon" in low:
+        return "팰컨 9 (Block 5)", "#66BB6A"
+    return None, "#B0BEC5"
+
+
+def npz_is_mesh(path: Path) -> bool:
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            needed = {"nodes", "quad_cells", "tri_cells", "face_nodes", "face_tag"}
+            return needed.issubset(set(data.files))
+    except Exception:
+        return False
+
+
+def discover_mesh_cases(workdir: Path) -> Dict[str, MeshCase]:
+    cases: Dict[str, MeshCase] = {}
+    candidates: Dict[str, Tuple[float, Path, str]] = {}
+    for path in workdir.glob("*.npz"):
+        if not npz_is_mesh(path):
+            continue
+        name, color = classify_mesh_case(path.name)
+        if name is None:
+            continue
+        mtime = path.stat().st_mtime
+        prev = candidates.get(name)
+        if prev is None or mtime > prev[0]:
+            candidates[name] = (mtime, path, color)
+
+    for name, (_, path, color) in candidates.items():
+        cases[name] = MeshCase(name=name, path=str(path), color=color)
+    return cases
+
+
+def polygon_metrics(poly_xy: np.ndarray) -> Tuple[float, float, float]:
+    x = poly_xy[:, 0]
+    y = poly_xy[:, 1]
+    x2 = np.roll(x, -1)
+    y2 = np.roll(y, -1)
+    cross = x * y2 - x2 * y
+    area_signed = 0.5 * np.sum(cross)
+    if abs(area_signed) < EPS:
+        center = np.mean(poly_xy, axis=0)
+        return center[0], center[1], 0.0
+    cx = np.sum((x + x2) * cross) / (6.0 * area_signed)
+    cy = np.sum((y + y2) * cross) / (6.0 * area_signed)
+    return cx, cy, area_signed
+
+
+def point_segment_distance(points: np.ndarray, seg_a: np.ndarray, seg_b: np.ndarray) -> np.ndarray:
+    ab = seg_b - seg_a
+    denom = np.dot(ab, ab) + EPS
+    t = np.clip(((points - seg_a) @ ab) / denom, 0.0, 1.0)
+    proj = seg_a[None, :] + t[:, None] * ab[None, :]
+    return np.sqrt(np.sum((points - proj) ** 2, axis=1))
+
+
+def compute_wall_distance(centers: np.ndarray, body_segments: np.ndarray) -> np.ndarray:
+    dist = np.full(len(centers), np.inf, dtype=np.float64)
+    seg_a = body_segments[:, 0, :]
+    seg_b = body_segments[:, 1, :]
+    chunk = 128
+    for start in range(0, len(seg_a), chunk):
+        a = seg_a[start : start + chunk]
+        b = seg_b[start : start + chunk]
+        local = np.full(len(centers), np.inf, dtype=np.float64)
+        for sa, sb in zip(a, b):
+            local = np.minimum(local, point_segment_distance(centers, sa, sb))
+        dist = np.minimum(dist, local)
+    return np.maximum(dist, 1e-6)
+
+
+def extract_body_profile(points: np.ndarray, n_bins: int = 800) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    pts = np.asarray(points, dtype=np.float64)
+    pts = pts[np.isfinite(pts[:, 0]) & np.isfinite(pts[:, 1])]
+    if len(pts) < 2:
+        raise ValueError("Not enough points to extract body profile")
+
+    x_min = float(np.min(pts[:, 0]))
+    x_max = float(np.max(pts[:, 0]))
+    bins = np.linspace(x_min, x_max, n_bins + 1)
+    picked = []
+    for i in range(n_bins):
+        if i == n_bins - 1:
+            mask = (pts[:, 0] >= bins[i]) & (pts[:, 0] <= bins[i + 1])
+        else:
+            mask = (pts[:, 0] >= bins[i]) & (pts[:, 0] < bins[i + 1])
+        if not np.any(mask):
+            continue
+        local = pts[mask]
+        idx = np.argmin(local[:, 1])
+        picked.append(local[idx])
+
+    prof = np.asarray(picked, dtype=np.float64)
+    prof = prof[np.argsort(prof[:, 0])]
+    _, uniq = np.unique(np.round(prof[:, 0], 8), return_index=True)
+    prof = prof[np.sort(uniq)]
+
+    if prof[0, 1] > 1e-8:
+        prof = np.vstack(([prof[0, 0], 0.0], prof))
+    else:
+        prof[0, 1] = 0.0
+    if prof[-1, 1] > 1e-8:
+        prof = np.vstack((prof, [prof[-1, 0], 0.0]))
+    else:
+        prof[-1, 1] = 0.0
+
+    step = np.sqrt(np.sum(np.diff(prof, axis=0) ** 2, axis=1))
+    keep = np.concatenate(([True], step > 1e-8))
+    prof = prof[keep]
+
+    body_segments = np.stack((prof[:-1], prof[1:]), axis=1)
+    return prof[:, 0], prof[:, 1], body_segments
+
+
+def split_segment_chains(segments: np.ndarray, tol: float = 1e-8) -> List[np.ndarray]:
+    if len(segments) == 0:
+        return []
+    chains = []
+    start = 0
+    for i in range(len(segments) - 1):
+        end_pt = segments[i, 1]
+        next_pt = segments[i + 1, 0]
+        if np.linalg.norm(end_pt - next_pt) > tol:
+            chains.append(segments[start : i + 1])
+            start = i + 1
+    chains.append(segments[start:])
+    return chains
+
+
+def canonicalize_nodes(nodes: np.ndarray, *cell_sets: np.ndarray) -> Tuple[np.ndarray, List[np.ndarray]]:
+    rounded = np.round(nodes, 10)
+    unique_nodes, inverse = np.unique(rounded, axis=0, return_inverse=True)
+    remapped = [inverse[cells] for cells in cell_sets]
+    return unique_nodes.astype(np.float64), remapped
+
+
+@st.cache_resource(show_spinner=False)
+def load_mesh(path: str, case_name: str) -> MeshData:
+    with np.load(path, allow_pickle=False) as data:
+        nodes = data["nodes"].astype(np.float64)
+        quad_cells = data["quad_cells"].astype(np.int32)
+        tri_cells = data["tri_cells"].astype(np.int32)
+        face_nodes = data["face_nodes"].astype(np.float64)
+        face_tag = data["face_tag"].astype(np.int8)
+
+    nodes, remapped_sets = canonicalize_nodes(nodes, quad_cells, tri_cells)
+    quad_cells, tri_cells = [cells.astype(np.int32, copy=False) for cells in remapped_sets]
+
+    cell_nodes: List[np.ndarray] = [row.copy() for row in quad_cells] + [row.copy() for row in tri_cells]
+    cell_types = np.concatenate(
+        [np.full(len(quad_cells), 4, dtype=np.int8), np.full(len(tri_cells), 3, dtype=np.int8)]
+    )
+    n_cells = len(cell_nodes)
+    centers = np.zeros((n_cells, 2), dtype=np.float64)
+    area = np.zeros(n_cells, dtype=np.float64)
+    orient = np.ones(n_cells, dtype=np.int8)
+    for i, cnodes in enumerate(cell_nodes):
+        cx, cr, a_signed = polygon_metrics(nodes[cnodes])
+        centers[i] = [cx, cr]
+        area[i] = abs(a_signed)
+        orient[i] = 1 if a_signed >= 0.0 else -1
+
+    volume = area * 2.0 * math.pi * np.maximum(centers[:, 1], 1e-6)
+
+    coord_to_node: Dict[Tuple[float, float], int] = {}
+    for idx, (x, r) in enumerate(nodes):
+        coord_to_node[(round(float(x), 10), round(float(r), 10))] = idx
+
+    body_end = 0
+    while body_end < len(face_tag) and int(face_tag[body_end]) == 1:
+        body_end += 1
+
+    tag1_segments = face_nodes[:body_end].astype(np.float64).copy()
+    chains = split_segment_chains(tag1_segments)
+    if not chains:
+        raise ValueError("Could not recover body chain from tag1 segments")
+    body_chain = min(chains, key=lambda segs: (np.max(segs[:, :, 1]), -len(segs)))
+    body_segments_arr = body_chain
+    profile_points = np.vstack([body_segments_arr[:, 0, :], body_segments_arr[-1, 1, :][None, :]])
+    profile_x = profile_points[:, 0]
+    profile_r = profile_points[:, 1]
+
+    body_edge_keys = set()
+    for seg in body_segments_arr:
+        a = coord_to_node.get((round(float(seg[0, 0]), 10), round(float(seg[0, 1]), 10)))
+        b = coord_to_node.get((round(float(seg[1, 0]), 10), round(float(seg[1, 1]), 10)))
+        if a is None or b is None:
+            continue
+        body_edge_keys.add((min(a, b), max(a, b)))
+
+    boundary_tags: Dict[Tuple[int, int], int] = {}
+    for seg, tag in zip(face_nodes, face_tag):
+        a = coord_to_node.get((round(float(seg[0, 0]), 10), round(float(seg[0, 1]), 10)))
+        b = coord_to_node.get((round(float(seg[1, 0]), 10), round(float(seg[1, 1]), 10)))
+        if a is None or b is None:
+            continue
+        boundary_tags[(min(a, b), max(a, b))] = int(tag)
+
+    edge_map: Dict[Tuple[int, int], List[Tuple[int, Tuple[int, int]]]] = {}
+    for icell, cnodes in enumerate(cell_nodes):
+        nloc = len(cnodes)
+        for j in range(nloc):
+            a = int(cnodes[j])
+            b = int(cnodes[(j + 1) % nloc])
+            key = (min(a, b), max(a, b))
+            edge_map.setdefault(key, []).append((icell, (a, b)))
+
+    faces_left = []
+    faces_right = []
+    face_node_a = []
+    face_node_b = []
+    face_center = []
+    face_normal = []
+    face_length = []
+    face_area = []
+    face_tags = []
+    cell_faces: List[List[int]] = [[] for _ in range(n_cells)]
+
+    for key, entries in edge_map.items():
+        left, directed = entries[0]
+        right = entries[1][0] if len(entries) == 2 else -1
+        a, b = directed
+        pa = nodes[a]
+        pb = nodes[b]
+        edge = pb - pa
+        length = float(np.linalg.norm(edge))
+        if length < EPS:
+            continue
+        if orient[left] > 0:
+            normal = np.array([edge[1], -edge[0]], dtype=np.float64) / length
+        else:
+            normal = np.array([-edge[1], edge[0]], dtype=np.float64) / length
+        midpoint = 0.5 * (pa + pb)
+        if right >= 0:
+            dc = centers[right] - centers[left]
+            if float(np.dot(normal, dc)) < 0.0:
+                normal *= -1.0
+        else:
+            dc = midpoint - centers[left]
+            if float(np.dot(normal, dc)) < 0.0:
+                normal *= -1.0
+        area_face = length * 2.0 * math.pi * max(float(midpoint[1]), 1e-6)
+        if right >= 0:
+            tag = 0
+        else:
+            tag = boundary_tags.get(key, 5)
+            if tag == 1 and key not in body_edge_keys:
+                tag = 5
+
+        idx = len(faces_left)
+        faces_left.append(left)
+        faces_right.append(right)
+        face_node_a.append(a)
+        face_node_b.append(b)
+        face_center.append(midpoint)
+        face_normal.append(normal)
+        face_length.append(length)
+        face_area.append(area_face)
+        face_tags.append(tag)
+        cell_faces[left].append(idx)
+        if right >= 0:
+            cell_faces[right].append(idx)
+
+    faces_left_arr = np.array(faces_left, dtype=np.int32)
+    faces_right_arr = np.array(faces_right, dtype=np.int32)
+    face_node_a_arr = np.array(face_node_a, dtype=np.int32)
+    face_node_b_arr = np.array(face_node_b, dtype=np.int32)
+    face_center_arr = np.array(face_center, dtype=np.float64)
+    face_normal_arr = np.array(face_normal, dtype=np.float64)
+    face_length_arr = np.array(face_length, dtype=np.float64)
+    face_area_arr = np.array(face_area, dtype=np.float64)
+    face_tags_arr = np.array(face_tags, dtype=np.int8)
+
+    wall_distance = compute_wall_distance(centers, body_segments_arr)
+    r_ref = float(np.max(profile_r))
+    length_ref = float(np.max(profile_x) - np.min(profile_x))
+    ref_area = math.pi * r_ref**2
+
+    return MeshData(
+        name=case_name,
+        path=path,
+        nodes=nodes,
+        cell_nodes=cell_nodes,
+        cell_types=cell_types,
+        cell_centers=centers,
+        cell_area=area,
+        cell_volume=volume,
+        cell_orientation=orient,
+        faces_left=faces_left_arr,
+        faces_right=faces_right_arr,
+        face_node_a=face_node_a_arr,
+        face_node_b=face_node_b_arr,
+        face_center=face_center_arr,
+        face_normal=face_normal_arr,
+        face_length=face_length_arr,
+        face_area=face_area_arr,
+        face_tag=face_tags_arr,
+        cell_faces=cell_faces,
+        wall_distance=wall_distance,
+        profile_x=profile_x,
+        profile_r=profile_r,
+        r_ref=r_ref,
+        length_ref=length_ref,
+        ref_area=ref_area,
+        body_segments=body_segments_arr,
+    )
+
+
+def freestream_state(mach: float, altitude: float, turb_intensity: float, turb_visc_ratio: float) -> Tuple[np.ndarray, Dict[str, float]]:
+    atm = isa_atmosphere(altitude)
+    a = atm["a"]
+    u = mach * a
+    v = 0.0
+    rho = atm["rho"]
+    p = atm["P"]
+    T = atm["T"]
+    mu = atm["mu"]
+    k = max(1.5 * (u * turb_intensity) ** 2, 1e-8)
+    omega = max(rho * k / (mu * turb_visc_ratio + EPS), 1.0)
+    e = p / ((GAMMA - 1.0) * rho)
+    E = e + 0.5 * (u * u + v * v) + k
+    U = np.array([rho, rho * u, rho * v, rho * E, rho * k, rho * omega], dtype=np.float64)
+    return U, {"rho": rho, "u": u, "v": v, "p": p, "T": T, "a": a, "mu": mu, "k": k, "omega": omega}
+
+
+def cons_to_prim(U: np.ndarray) -> Dict[str, np.ndarray]:
+    rho = np.maximum(U[:, 0], 1e-8)
+    u = U[:, 1] / rho
+    v = U[:, 2] / rho
+    k = np.maximum(U[:, 4] / rho, 1e-8)
+    omega = np.maximum(U[:, 5] / rho, 1.0)
+    E = U[:, 3] / rho
+    eint = np.maximum(E - 0.5 * (u * u + v * v) - k, 1e-6)
+    p = np.maximum((GAMMA - 1.0) * rho * eint, 1.0)
+    T = p / (rho * R_AIR)
+    a = np.sqrt(np.maximum(GAMMA * R_AIR * T, 1.0))
+    H = E + p / rho
+    return {"rho": rho, "u": u, "v": v, "p": p, "T": T, "a": a, "k": k, "omega": omega, "E": E, "H": H}
+
+
+def sutherland_mu(T: np.ndarray) -> np.ndarray:
+    return 1.458e-6 * np.maximum(T, 50.0) ** 1.5 / (np.maximum(T, 50.0) + 110.4)
+
+
+def primitive_matrix(prim: Dict[str, np.ndarray]) -> np.ndarray:
+    return np.column_stack([prim["rho"], prim["u"], prim["v"], prim["p"], prim["T"], prim["k"], prim["omega"]])
+
+
+def compute_gradients(mesh: MeshData, phi: np.ndarray) -> np.ndarray:
+    n_cells, n_var = phi.shape
+    grad = np.zeros((n_cells, n_var, 2), dtype=np.float64)
+    for iface in range(len(mesh.faces_left)):
+        left = mesh.faces_left[iface]
+        right = mesh.faces_right[iface]
+        nvec = mesh.face_normal[iface]
+        area = mesh.face_area[iface]
+        if right >= 0:
+            phi_face = 0.5 * (phi[left] + phi[right])
+            grad[left] += phi_face[:, None] * nvec[None, :] * area
+            grad[right] -= phi_face[:, None] * nvec[None, :] * area
+        else:
+            phi_face = phi[left]
+            grad[left] += phi_face[:, None] * nvec[None, :] * area
+    grad /= mesh.cell_volume[:, None, None] + EPS
+    return grad
+
+
+def sst_closure(mesh: MeshData, prim: Dict[str, np.ndarray], grad: np.ndarray) -> Dict[str, np.ndarray]:
+    rho = prim["rho"]
+    T = prim["T"]
+    k = prim["k"]
+    omega = prim["omega"]
+    u = prim["u"]
+    v = prim["v"]
+
+    mu_l = sutherland_mu(T)
+    nu = mu_l / rho
+
+    du_dx = grad[:, 1, 0]
+    du_dr = grad[:, 1, 1]
+    dv_dx = grad[:, 2, 0]
+    dv_dr = grad[:, 2, 1]
+    dk_dx = grad[:, 5, 0]
+    dk_dr = grad[:, 5, 1]
+    dw_dx = grad[:, 6, 0]
+    dw_dr = grad[:, 6, 1]
+    y = mesh.wall_distance
+
+    s2 = 2.0 * du_dx**2 + 2.0 * dv_dr**2 + (du_dr + dv_dx) ** 2
+    S = np.sqrt(np.maximum(s2, 1e-12))
+
+    sigma_k1 = 0.85
+    sigma_k2 = 1.00
+    sigma_w1 = 0.50
+    sigma_w2 = 0.856
+    beta1 = 0.075
+    beta2 = 0.0828
+    beta_star = 0.09
+    alpha1 = 5.0 / 9.0
+    alpha2 = 0.44
+    a1 = 0.31
+
+    gradk_dot_gradw = dk_dx * dw_dx + dk_dr * dw_dr
+    cd_kw = np.maximum(2.0 * rho * sigma_w2 * gradk_dot_gradw / np.maximum(omega, 1.0), 1e-12)
+    arg1_a = np.sqrt(np.maximum(k, 0.0)) / np.maximum(beta_star * omega * y, 1e-9)
+    arg1_b = 500.0 * nu / np.maximum(y * y * omega, 1e-9)
+    arg1_c = 4.0 * rho * sigma_w2 * k / np.maximum(cd_kw * y * y, 1e-9)
+    arg1 = np.minimum(np.maximum(arg1_a, arg1_b), arg1_c)
+    F1 = np.tanh(arg1**4)
+
+    arg2 = np.maximum(2.0 * np.sqrt(np.maximum(k, 0.0)) / np.maximum(beta_star * omega * y, 1e-9), arg1_b)
+    F2 = np.tanh(arg2**2)
+
+    sigma_k = F1 * sigma_k1 + (1.0 - F1) * sigma_k2
+    sigma_w = F1 * sigma_w1 + (1.0 - F1) * sigma_w2
+    alpha = F1 * alpha1 + (1.0 - F1) * alpha2
+    beta = F1 * beta1 + (1.0 - F1) * beta2
+
+    mu_t = rho * a1 * np.maximum(k, 0.0) / np.maximum(a1 * omega, S * F2 + 1e-12)
+    mu_t = np.clip(mu_t, 0.0, 5000.0 * mu_l)
+
+    Pk = np.minimum(mu_t * s2, 20.0 * beta_star * rho * k * omega)
+    src_k = Pk - beta_star * rho * k * omega
+    src_w = alpha * rho * s2 - beta * rho * omega**2
+    src_w += 2.0 * (1.0 - F1) * rho * sigma_w2 * gradk_dot_gradw / np.maximum(omega, 1.0)
+
+    # The SST transport equations are the stiffest part of this lightweight solver.
+    # Limit raw source spikes so early pseudo-time iterations do not blow up before
+    # the near-wall field settles on the imported hybrid mesh.
+    src_k_lim = 100.0 * rho * np.maximum(k, 1e-8) * np.maximum(omega, 1.0)
+    src_w_lim = 100.0 * rho * np.maximum(omega, 1.0) ** 2
+    src_k = np.clip(src_k, -src_k_lim, src_k_lim)
+    src_w = np.clip(src_w, -src_w_lim, src_w_lim)
+
+    cp = GAMMA * R_AIR / (GAMMA - 1.0)
+    kappa_eff = cp * (mu_l / PR_LAM + mu_t / PR_T)
+
+    return {
+        "mu_l": mu_l,
+        "mu_t": mu_t,
+        "mu_eff": mu_l + mu_t,
+        "sigma_k": sigma_k,
+        "sigma_w": sigma_w,
+        "kappa_eff": kappa_eff,
+        "S": S,
+        "src_k": src_k,
+        "src_w": src_w,
+    }
+
+
+def ausm_plus_flux(UL: np.ndarray, UR: np.ndarray, normal: np.ndarray) -> Tuple[np.ndarray, float]:
+    ULm = UL[None, :]
+    URm = UR[None, :]
+    pL = cons_to_prim(ULm)
+    pR = cons_to_prim(URm)
+
+    rhoL = pL["rho"][0]
+    rhoR = pR["rho"][0]
+    uL = pL["u"][0]
+    uR = pR["u"][0]
+    vL = pL["v"][0]
+    vR = pR["v"][0]
+    p_left = pL["p"][0]
+    p_right = pR["p"][0]
+    aL = pL["a"][0]
+    aR = pR["a"][0]
+    HL = pL["H"][0]
+    HR = pR["H"][0]
+
+    unL = uL * normal[0] + vL * normal[1]
+    unR = uR * normal[0] + vR * normal[1]
+    a_face = max(0.5 * (aL + aR), 1.0)
+    ML = unL / a_face
+    MR = unR / a_face
+    beta = 0.125
+    alpha = 3.0 / 16.0
+
+    def m4_plus(M):
+        if abs(M) >= 1.0:
+            return 0.5 * (M + abs(M))
+        return 0.25 * (M + 1.0) ** 2 + beta * (M * M - 1.0) ** 2
+
+    def m4_minus(M):
+        if abs(M) >= 1.0:
+            return 0.5 * (M - abs(M))
+        return -0.25 * (M - 1.0) ** 2 - beta * (M * M - 1.0) ** 2
+
+    def p5_plus(M):
+        if abs(M) >= 1.0:
+            return 0.5 * (1.0 + np.sign(M))
+        return 0.25 * (M + 1.0) ** 2 * (2.0 - M) + alpha * M * (M * M - 1.0) ** 2
+
+    def p5_minus(M):
+        if abs(M) >= 1.0:
+            return 0.5 * (1.0 - np.sign(M))
+        return 0.25 * (M - 1.0) ** 2 * (2.0 + M) - alpha * M * (M * M - 1.0) ** 2
+
+    mdot = a_face * (rhoL * m4_plus(ML) + rhoR * m4_minus(MR))
+    p_int = p_left * p5_plus(ML) + p_right * p5_minus(MR)
+
+    if mdot >= 0.0:
+        rho = rhoL
+        u = uL
+        v = vL
+        H = HL
+        k = pL["k"][0]
+        omega = pL["omega"][0]
+    else:
+        rho = rhoR
+        u = uR
+        v = vR
+        H = HR
+        k = pR["k"][0]
+        omega = pR["omega"][0]
+
+    flux = np.array(
+        [
+            mdot,
+            mdot * u + p_int * normal[0],
+            mdot * v + p_int * normal[1],
+            mdot * H,
+            mdot * k,
+            mdot * omega,
+        ],
+        dtype=np.float64,
+    )
+    lam = abs(unL) + abs(unR) + aL + aR
+    return flux, lam
+
+
+def boundary_ghost_state(mesh: MeshData, iface: int, UL: np.ndarray, U_inf: np.ndarray) -> np.ndarray:
+    tag = int(mesh.face_tag[iface])
+    prim_l = cons_to_prim(UL[None, :])
+    rho = prim_l["rho"][0]
+    p = prim_l["p"][0]
+    T = prim_l["T"][0]
+    u = prim_l["u"][0]
+    v = prim_l["v"][0]
+    k = prim_l["k"][0]
+    omega = prim_l["omega"][0]
+    n = mesh.face_normal[iface]
+
+    if tag in (3, 4, 5):
+        return U_inf.copy()
+
+    if tag == 2:
+        vel = np.array([u, v], dtype=np.float64)
+        vel_g = vel - 2.0 * np.dot(vel, n) * n
+        e = p / ((GAMMA - 1.0) * rho)
+        E = e + 0.5 * np.dot(vel_g, vel_g) + k
+        return np.array([rho, rho * vel_g[0], rho * vel_g[1], rho * E, rho * k, rho * omega], dtype=np.float64)
+
+    if tag == 1:
+        left = mesh.faces_left[iface]
+        y = mesh.wall_distance[left]
+        mu = sutherland_mu(np.array([T]))[0]
+        beta1 = 0.075
+        omega_wall = max(60.0 * mu / (rho * beta1 * y * y + EPS), 10.0)
+        vel_g = np.array([-u, -v], dtype=np.float64)
+        k_g = 1e-8
+        e = p / ((GAMMA - 1.0) * rho)
+        E = e + 0.5 * np.dot(vel_g, vel_g) + k_g
+        return np.array([rho, rho * vel_g[0], rho * vel_g[1], rho * E, rho * k_g, rho * omega_wall], dtype=np.float64)
+
+    return U_inf.copy()
+
+
+def viscous_flux(
+    mesh: MeshData,
+    iface: int,
+    prim: Dict[str, np.ndarray],
+    grad: np.ndarray,
+    closure: Dict[str, np.ndarray],
+) -> np.ndarray:
+    left = mesh.faces_left[iface]
+    right = mesh.faces_right[iface]
+    n = mesh.face_normal[iface]
+    rc = max(mesh.face_center[iface, 1], 1e-6)
+
+    if right >= 0:
+        grad_face = 0.5 * (grad[left] + grad[right])
+        u = 0.5 * (prim["u"][left] + prim["u"][right])
+        v = 0.5 * (prim["v"][left] + prim["v"][right])
+        mu = 0.5 * (closure["mu_eff"][left] + closure["mu_eff"][right])
+        kappa = 0.5 * (closure["kappa_eff"][left] + closure["kappa_eff"][right])
+        gamma_k = 0.5 * (
+            (closure["mu_l"][left] + closure["mu_t"][left] / closure["sigma_k"][left])
+            + (closure["mu_l"][right] + closure["mu_t"][right] / closure["sigma_k"][right])
+        )
+        gamma_w = 0.5 * (
+            (closure["mu_l"][left] + closure["mu_t"][left] / closure["sigma_w"][left])
+            + (closure["mu_l"][right] + closure["mu_t"][right] / closure["sigma_w"][right])
+        )
+    else:
+        grad_face = grad[left]
+        u = prim["u"][left]
+        v = prim["v"][left]
+        mu = closure["mu_eff"][left]
+        kappa = closure["kappa_eff"][left]
+        gamma_k = closure["mu_l"][left] + closure["mu_t"][left] / closure["sigma_k"][left]
+        gamma_w = closure["mu_l"][left] + closure["mu_t"][left] / closure["sigma_w"][left]
+
+    du_dx = grad_face[1, 0]
+    du_dr = grad_face[1, 1]
+    dv_dx = grad_face[2, 0]
+    dv_dr = grad_face[2, 1]
+    dT_dx = grad_face[4, 0]
+    dT_dr = grad_face[4, 1]
+    dk_dx = grad_face[5, 0]
+    dk_dr = grad_face[5, 1]
+    dw_dx = grad_face[6, 0]
+    dw_dr = grad_face[6, 1]
+
+    div_v = du_dx + dv_dr + v / rc
+    tau_xx = 2.0 * mu * du_dx - (2.0 / 3.0) * mu * div_v
+    tau_rr = 2.0 * mu * dv_dr - (2.0 / 3.0) * mu * div_v
+    tau_xr = mu * (du_dr + dv_dx)
+    qx = -kappa * dT_dx
+    qr = -kappa * dT_dr
+
+    flux = np.zeros(6, dtype=np.float64)
+    flux[1] = tau_xx * n[0] + tau_xr * n[1]
+    flux[2] = tau_xr * n[0] + tau_rr * n[1]
+    flux[3] = (u * tau_xx + v * tau_xr + qx) * n[0] + (u * tau_xr + v * tau_rr + qr) * n[1]
+    flux[4] = gamma_k * (dk_dx * n[0] + dk_dr * n[1])
+    flux[5] = gamma_w * (dw_dx * n[0] + dw_dr * n[1])
+    return flux
+
+
+def compute_residual(mesh: MeshData, U: np.ndarray, U_inf: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, np.ndarray]]:
+    prim = cons_to_prim(U)
+    phi = primitive_matrix(prim)
+    grad = compute_gradients(mesh, phi)
+    closure = sst_closure(mesh, prim, grad)
+
+    res = np.zeros_like(U)
+    diag_spec = np.zeros(len(mesh.cell_nodes), dtype=np.float64)
+    face_spec = np.zeros(len(mesh.faces_left), dtype=np.float64)
+
+    for iface in range(len(mesh.faces_left)):
+        left = mesh.faces_left[iface]
+        right = mesh.faces_right[iface]
+        UL = U[left]
+        UR = U[right] if right >= 0 else boundary_ghost_state(mesh, iface, UL, U_inf)
+        flux_c, lam = ausm_plus_flux(UL, UR, mesh.face_normal[iface])
+        flux_v = viscous_flux(mesh, iface, prim, grad, closure)
+        total_flux = (flux_c - flux_v) * mesh.face_area[iface]
+        res[left] += total_flux
+        diag_spec[left] += lam * mesh.face_area[iface]
+        if right >= 0:
+            res[right] -= total_flux
+            diag_spec[right] += lam * mesh.face_area[iface]
+        face_spec[iface] = lam * mesh.face_area[iface]
+
+    src = np.zeros_like(U)
+    src[:, 4] = closure["src_k"]
+    src[:, 5] = closure["src_w"]
+    res -= src * mesh.cell_volume[:, None]
+
+    return res, diag_spec, face_spec, {"prim": prim, "grad": grad, "closure": closure}
+
+
+def lusgs_step(
+    mesh: MeshData,
+    U: np.ndarray,
+    res: np.ndarray,
+    diag_spec: np.ndarray,
+    face_spec: np.ndarray,
+    cfl: float,
+) -> np.ndarray:
+    order = np.argsort(mesh.cell_centers[:, 0])
+    rank = np.empty_like(order)
+    rank[order] = np.arange(len(order))
+
+    dt = cfl * mesh.cell_volume / (diag_spec + EPS)
+    diag = mesh.cell_volume / (dt + EPS) + 0.5 * diag_spec + 1e-8
+    delta = np.zeros_like(U)
+
+    for i in order:
+        corr = np.zeros(U.shape[1], dtype=np.float64)
+        for iface in mesh.cell_faces[i]:
+            l = mesh.faces_left[iface]
+            r = mesh.faces_right[iface]
+            j = r if l == i else l
+            if j < 0 or rank[j] >= rank[i]:
+                continue
+            corr += 0.25 * face_spec[iface] * delta[j]
+        delta[i] = (-res[i] - corr) / diag[i]
+
+    for i in order[::-1]:
+        corr = np.zeros(U.shape[1], dtype=np.float64)
+        for iface in mesh.cell_faces[i]:
+            l = mesh.faces_left[iface]
+            r = mesh.faces_right[iface]
+            j = r if l == i else l
+            if j < 0 or rank[j] <= rank[i]:
+                continue
+            corr += 0.25 * face_spec[iface] * delta[j]
+        delta[i] = delta[i] - corr / diag[i]
+
+    return delta
+
+
+def enforce_physical_bounds(U: np.ndarray) -> np.ndarray:
+    prim = cons_to_prim(U)
+    rho = np.maximum(prim["rho"], 1e-8)
+    u = prim["u"]
+    v = prim["v"]
+    p = np.maximum(prim["p"], 100.0)
+    k = np.maximum(prim["k"], 1e-8)
+    omega = np.maximum(prim["omega"], 1.0)
+    e = p / ((GAMMA - 1.0) * rho)
+    E = e + 0.5 * (u * u + v * v) + k
+    bounded = np.column_stack([rho, rho * u, rho * v, rho * E, rho * k, rho * omega])
+    return bounded
+
+
+def force_coefficients(mesh: MeshData, prim: Dict[str, np.ndarray], grad: np.ndarray, closure: Dict[str, np.ndarray], freestream: Dict[str, float], alpha_proxy_deg: float) -> Dict[str, float]:
+    q_inf = 0.5 * freestream["rho"] * freestream["u"] ** 2
+    area_ref = mesh.ref_area
+    fx_p = 0.0
+    fr_p = 0.0
+    fx_v = 0.0
+    fr_v = 0.0
+
+    for iface, tag in enumerate(mesh.face_tag):
+        if int(tag) != 1:
+            continue
+        left = mesh.faces_left[iface]
+        n = mesh.face_normal[iface]
+        af = mesh.face_area[iface]
+        p = prim["p"][left]
+        visc = viscous_flux(mesh, iface, prim, grad, closure)
+        fp = -p * n * af
+        fv = np.array([visc[1], visc[2]]) * af
+        fx_p += fp[0]
+        fr_p += fp[1]
+        fx_v += fv[0]
+        fr_v += fv[1]
+
+    fx_total = fx_p + fx_v
+    fr_total = fr_p + fr_v
+    cd_pressure = fx_p / (q_inf * area_ref + EPS)
+    cd_viscous = fx_v / (q_inf * area_ref + EPS)
+    cd_total = fx_total / (q_inf * area_ref + EPS)
+
+    # Axisymmetric single-body mesh cannot directly resolve off-axis load.
+    # Keep streamlit outputs by combining radial proxy and legacy slender-body relation.
+    alpha = math.radians(alpha_proxy_deg)
+    slender_proxy = 2.0 * alpha * (1.0 + 1.0 / max(2.0 * mesh.length_ref / (2.0 * mesh.r_ref + EPS), 1.0))
+    cn = 0.5 * abs(fr_total) / (q_inf * area_ref + EPS) + 0.5 * slender_proxy
+    x_cp = 0.35 * mesh.length_ref
+    x_cg = 0.45 * mesh.length_ref
+    cm = cn * (x_cg - x_cp) / (2.0 * mesh.r_ref + EPS)
+
+    return {
+        "CD_total": cd_total,
+        "CD_pressure": cd_pressure,
+        "CD_viscous": cd_viscous,
+        "CD_turbulent": max(cd_total - cd_pressure - cd_viscous, 0.0),
+        "CN": cn,
+        "Cm": cm,
+    }
+
+
+def solve_case(
+    mesh: MeshData,
+    cfg: SolverConfig,
+    progress_callback: Callable[[str, float], None] | None = None,
+) -> SolverResult:
+    U_inf, freestream = freestream_state(cfg.mach, cfg.altitude, cfg.turbulence_intensity, cfg.turb_visc_ratio)
+    U = np.tile(U_inf, (len(mesh.cell_nodes), 1))
+
+    residual_history: List[float] = []
+    t0 = time.perf_counter()
+    last_aux = None
+    for it in range(cfg.max_iter):
+        res, diag_spec, face_spec, aux = compute_residual(mesh, U, U_inf)
+        last_aux = aux
+        rnorm = float(np.linalg.norm(res[:, 0]) / math.sqrt(len(mesh.cell_nodes)))
+        residual_history.append(rnorm)
+        if progress_callback is not None:
+            progress_callback(
+                f"[{mesh.name}] LU-SGS {it + 1}/{cfg.max_iter} | continuity residual = {rnorm:.3e}",
+                (it + 1) / max(cfg.max_iter, 1),
+            )
+        if rnorm < cfg.tol:
+            break
+        dU = lusgs_step(mesh, U, res, diag_spec, face_spec, cfg.cfl)
+        flow_relax = min(1.0, 0.2 + 0.1 * it)
+        turb_relax = min(0.35, 0.05 + 0.05 * it)
+        dU[:, :4] *= flow_relax
+        dU[:, 4:] *= turb_relax
+        U = enforce_physical_bounds(U + dU)
+
+    runtime_s = time.perf_counter() - t0
+    if last_aux is None:
+        _, _, _, last_aux = compute_residual(mesh, U, U_inf)
+
+    coeffs = force_coefficients(mesh, last_aux["prim"], last_aux["grad"], last_aux["closure"], freestream, cfg.alpha_proxy_deg)
+    return SolverResult(
+        U=U,
+        primitive=last_aux["prim"],
+        residual_history=residual_history,
+        runtime_s=runtime_s,
+        coeffs=coeffs,
+        mesh_points=len(mesh.nodes),
+        n_cells=len(mesh.cell_nodes),
+        n_faces=len(mesh.faces_left),
+    )
+
+
+def run_mach_sweep(
+    mesh: MeshData,
+    mach_arr: np.ndarray,
+    altitude: float,
+    base_cfg: SolverConfig,
+    progress_callback: Callable[[str, float], None] | None = None,
+) -> Dict[str, List[float]]:
+    cds = []
+    cns = []
+    cms = []
+    runtimes = []
+    for idx, M in enumerate(mach_arr):
+        cfg = SolverConfig(
+            mach=float(M),
+            altitude=altitude,
+            cfl=base_cfg.cfl,
+            max_iter=max(4, min(base_cfg.max_iter, 8)),
+            tol=base_cfg.tol,
+            turbulence_intensity=base_cfg.turbulence_intensity,
+            turb_visc_ratio=base_cfg.turb_visc_ratio,
+            alpha_proxy_deg=base_cfg.alpha_proxy_deg,
+        )
+        if progress_callback is not None:
+            progress_callback(
+                f"[{mesh.name}] Mach sweep {idx + 1}/{len(mach_arr)} | M = {M:.2f}",
+                (idx + 1) / max(len(mach_arr), 1),
+            )
+        result = solve_case(mesh, cfg)
+        cds.append(result.coeffs["CD_total"])
+        cns.append(result.coeffs["CN"])
+        cms.append(result.coeffs["Cm"])
+        runtimes.append(result.runtime_s)
+    return {"cd": cds, "cn": cns, "cm": cms, "runtime": runtimes}
+
+
+def plot_rocket_profile(meshes: Dict[str, MeshData], cases: Dict[str, MeshCase]) -> go.Figure:
+    fig = go.Figure()
+    for name, mesh in meshes.items():
+        color = cases[name].color
+        fig.add_trace(
+            go.Scatter(
+                x=mesh.profile_x,
+                y=mesh.profile_r,
+                mode="lines",
+                name=f"{name} (+)",
+                line=dict(color=color, width=2.5),
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=mesh.profile_x,
+                y=-mesh.profile_r,
+                mode="lines",
+                name=f"{name} (-)",
+                line=dict(color=color, width=2.5, dash="dot"),
+                showlegend=False,
+            )
+        )
+    fig.update_layout(
+        title="▌ 1.mesh NPZ 기반 발사체 프로파일 비교",
+        template="plotly_dark",
+        height=380,
+        xaxis_title="축 방향 위치 x [m]",
+        yaxis_title="반경 r [m]",
+        yaxis=dict(scaleanchor="x", scaleratio=1),
+    )
+    return fig
+
+
+def plot_cd_vs_mach(mach_arr: np.ndarray, sweep_data: Dict[str, Dict[str, List[float]]], cases: Dict[str, MeshCase]) -> go.Figure:
+    fig = go.Figure()
+    for name, data in sweep_data.items():
+        fig.add_trace(
+            go.Scatter(
+                x=mach_arr,
+                y=data["cd"],
+                mode="lines+markers",
+                name=name,
+                line=dict(color=cases[name].color, width=2.8),
+            )
+        )
+    fig.update_layout(
+        title="▌ CFD 기반 CD vs Mach (AUSM+ / LU-SGS / k-ω SST)",
+        template="plotly_dark",
+        height=420,
+        xaxis_title="Mach",
+        yaxis_title="CD",
+    )
+    return fig
+
+
+def plot_cn_cm_vs_mach(mach_arr: np.ndarray, sweep_data: Dict[str, Dict[str, List[float]]], cases: Dict[str, MeshCase]) -> go.Figure:
+    fig = go.Figure()
+    for name, data in sweep_data.items():
+        fig.add_trace(
+            go.Scatter(
+                x=mach_arr,
+                y=data["cn"],
+                mode="lines",
+                name=f"{name} - CN",
+                line=dict(color=cases[name].color, width=2.5),
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=mach_arr,
+                y=data["cm"],
+                mode="lines",
+                name=f"{name} - Cm",
+                line=dict(color=cases[name].color, width=1.8, dash="dash"),
+            )
+        )
+    fig.update_layout(
+        title="▌ 안정성 계수 스윕",
+        template="plotly_dark",
+        height=420,
+        xaxis_title="Mach",
+        yaxis_title="Coefficient",
+    )
+    return fig
+
+
+def plot_cd_breakdown(result: SolverResult, title: str) -> go.Figure:
+    labels = ["Pressure", "Viscous", "Turbulent/Closure"]
+    values = [
+        result.coeffs["CD_pressure"],
+        result.coeffs["CD_viscous"],
+        result.coeffs["CD_turbulent"],
+    ]
+    fig = go.Figure(
+        data=[
+            go.Pie(
+                labels=labels,
+                values=values,
+                hole=0.45,
+                marker=dict(colors=["#4FC3F7", "#66BB6A", "#FFB74D"]),
+                textinfo="label+percent",
+            )
+        ]
+    )
+    fig.update_layout(title=title, template="plotly_dark", height=330)
+    return fig
+
+
+def build_visible_cell_polygons(
+    mesh: MeshData,
+    values: np.ndarray,
+    cell_mask: np.ndarray | None = None,
+    x_min: float | None = None,
+    x_max: float | None = None,
+    r_lim: float | None = None,
+):
+    x0 = float(mesh.profile_x.min())
+    x1 = float(mesh.profile_x.max())
+    rmax = float(mesh.profile_r.max())
+    L = max(x1 - x0, 1.0)
+    if x_min is None:
+        x_min = x0 - 0.12 * L
+    if x_max is None:
+        x_max = x1 + 0.65 * L
+    if r_lim is None:
+        r_lim = max(2.8 * rmax, 0.20 * L + 1.4 * rmax)
+
+    polys_top = []
+    polys_bot = []
+    vals = []
+    for icell, cnodes in enumerate(mesh.cell_nodes):
+        if cell_mask is not None and not bool(cell_mask[icell]):
+            continue
+        ctr = mesh.cell_centers[icell]
+        if ctr[0] < x_min or ctr[0] > x_max or ctr[1] < 0.0 or ctr[1] > r_lim:
+            continue
+        poly = mesh.nodes[cnodes]
+        polys_top.append(poly)
+        poly_m = poly.copy()
+        poly_m[:, 1] *= -1.0
+        polys_bot.append(poly_m)
+        vals.append(values[icell])
+    return polys_top, polys_bot, np.asarray(vals, dtype=np.float64), x_min, x_max, r_lim
+
+
+def plot_single_profile(mesh: MeshData, color: str, title: str) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=mesh.profile_x,
+            y=mesh.profile_r,
+            mode="lines",
+            line=dict(color=color, width=2.6),
+            name="upper",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=mesh.profile_x,
+            y=-mesh.profile_r,
+            mode="lines",
+            line=dict(color=color, width=2.6),
+            name="lower",
+            showlegend=False,
+        )
+    )
+    fig.update_layout(
+        title=title,
+        template="plotly_dark",
+        height=320,
+        xaxis_title="x [m]",
+        yaxis_title="r [m]",
+        yaxis=dict(scaleanchor="x", scaleratio=1),
+    )
+    return fig
+
+
+def plot_flowfield(
+    mesh: MeshData,
+    result: SolverResult,
+    var_name: str,
+    case_color: str,
+    mach: float,
+    region: str = "full",
+):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import PolyCollection
+    from matplotlib.colors import Normalize, TwoSlopeNorm
+
+    mach_field = np.sqrt(result.primitive["u"] ** 2 + result.primitive["v"] ** 2) / np.maximum(result.primitive["a"], 1.0)
+    rho_inf = float(np.median(result.primitive["rho"]))
+    p_inf = float(np.median(result.primitive["p"]))
+    u_inf = max(float(np.median(result.primitive["u"])), 1.0)
+    q_inf = 0.5 * rho_inf * u_inf * u_inf
+    cp_field = (result.primitive["p"] - p_inf) / max(q_inf, 1.0)
+    field = {
+        "P": result.primitive["p"],
+        "rho": result.primitive["rho"],
+        "T": result.primitive["T"],
+        "Mach": mach_field,
+        "Cp": cp_field,
+    }[var_name]
+    x0 = float(mesh.profile_x.min())
+    x1 = float(mesh.profile_x.max())
+    rmax = float(mesh.profile_r.max())
+    L = max(x1 - x0, 1.0)
+
+    if region == "quad":
+        quad_mask = mesh.cell_types == 4
+        x_min = x0 - 0.03 * L
+        x_max = x1 + 0.06 * L
+        r_lim = max(1.25 * float(np.max(mesh.cell_centers[quad_mask, 1])), 1.3 * rmax)
+        polys_top, polys_bot, poly_vals, x_min, x_max, r_lim = build_visible_cell_polygons(
+            mesh, field, cell_mask=quad_mask, x_min=x_min, x_max=x_max, r_lim=r_lim
+        )
+        title_suffix = "Near-Body Quad Layer"
+    elif region == "boattail":
+        x_min = x1 - 0.28 * L
+        x_max = x1 + 0.18 * L
+        r_lim = max(1.8 * rmax, 0.7 * rmax + 0.05 * L)
+        polys_top, polys_bot, poly_vals, x_min, x_max, r_lim = build_visible_cell_polygons(
+            mesh, field, x_min=x_min, x_max=x_max, r_lim=r_lim
+        )
+        title_suffix = "Boattail Zoom"
+    else:
+        polys_top, polys_bot, poly_vals, x_min, x_max, r_lim = build_visible_cell_polygons(mesh, field)
+        title_suffix = "Full Domain"
+
+    if len(poly_vals) == 0:
+        fig, ax = plt.subplots(figsize=(8, 4), dpi=150)
+        ax.text(0.5, 0.5, "No visible cells in selected region", ha="center", va="center")
+        ax.axis("off")
+        return fig
+
+    vmin = float(np.nanpercentile(poly_vals, 2))
+    vmax = float(np.nanpercentile(poly_vals, 98))
+    if var_name == "Cp":
+        vabs = max(abs(vmin), abs(vmax), 1e-6)
+        norm = TwoSlopeNorm(vmin=-vabs, vcenter=0.0, vmax=vabs)
+    else:
+        norm = Normalize(vmin=vmin, vmax=vmax)
+
+    fig, ax = plt.subplots(figsize=(13, 5.8), dpi=150, facecolor="white")
+    cmap = plt.get_cmap("turbo")
+    coll_top = PolyCollection(polys_top, array=poly_vals, cmap=cmap, norm=norm, edgecolors="none", linewidths=0.0)
+    coll_bot = PolyCollection(polys_bot, array=poly_vals, cmap=cmap, norm=norm, edgecolors="none", linewidths=0.0)
+    ax.add_collection(coll_top)
+    ax.add_collection(coll_bot)
+
+    ax.fill_between(mesh.profile_x, mesh.profile_r, -mesh.profile_r, color="black", zorder=5)
+    ax.plot(mesh.profile_x, mesh.profile_r, color="black", linewidth=1.0, zorder=6)
+    ax.plot(mesh.profile_x, -mesh.profile_r, color="black", linewidth=1.0, zorder=6)
+    ax.axhline(0.0, color="white", linewidth=0.6, alpha=0.7)
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(-r_lim, r_lim)
+    ax.set_aspect("equal")
+    ax.set_title(f"{title_suffix} | {var_name} | Mach={mach:.2f}", fontsize=13, color="black")
+    ax.set_xlabel("x [m]")
+    ax.set_ylabel("r [m]")
+    ax.set_facecolor("white")
+
+    sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, pad=0.015, fraction=0.03)
+    cbar.set_label(var_name)
+
+    fig.tight_layout()
+    return fig
+
+
+def plot_residual_history(result: SolverResult, title: str) -> go.Figure:
+    fig = go.Figure(
+        data=[
+            go.Scatter(
+                x=np.arange(1, len(result.residual_history) + 1),
+                y=result.residual_history,
+                mode="lines+markers",
+                line=dict(color="#4FC3F7", width=2.5),
+            )
+        ]
+    )
+    fig.update_layout(
+        title=title,
+        template="plotly_dark",
+        height=300,
+        xaxis_title="LU-SGS iteration",
+        yaxis_title="L2 residual (continuity)",
+        yaxis_type="log",
+    )
+    return fig
+
+
+def render_results_bundle(bundle: Dict, flow_field_var: str, flow_rocket_name: str):
+    atm_cond = bundle["atm_cond"]
+    mach_arr = bundle["mach_arr"]
+    selected_cases = bundle["selected_cases"]
+    selected_meshes = bundle["selected_meshes"]
+    single_results = bundle["single_results"]
+    sweep_results = bundle["sweep_results"]
+    M_single = bundle["M_single"]
+    altitude = bundle["altitude"]
+    est_runtime_s = bundle["estimated_runtime_s"]
+
+    st.markdown('<div class="section-header">🌐 ISA 대기 조건 (해석 고도)</div>', unsafe_allow_html=True)
+    c1, c2, c3, c4, c5 = st.columns(5)
+    metric_card(c1, "고도", f"{altitude/1000:.1f}", "km")
+    metric_card(c2, "온도 T", f"{atm_cond['T']:.1f}", "K")
+    metric_card(c3, "압력 P", f"{atm_cond['P']/1000:.2f}", "kPa")
+    metric_card(c4, "밀도 ρ", f"{atm_cond['rho']:.4f}", "kg/m³")
+    metric_card(c5, "음속 a", f"{atm_cond['a']:.1f}", "m/s")
+
+    st.markdown('<div class="section-header">📊 수치 해석 결과</div>', unsafe_allow_html=True)
+    st.caption(f"예상 계산 시간(현재 설정 기준): 약 {est_runtime_s/60:.1f}분 ({est_runtime_s:.0f}초)")
+
+    rows = []
+    for name, mesh in selected_meshes.items():
+        res = single_results[name]
+        rows.append(
+            {
+                "발사체": name,
+                "격자 노드 수": f"{res.mesh_points:,}",
+                "제어체적 수": f"{res.n_cells:,}",
+                "면(face) 수": f"{res.n_faces:,}",
+                "계산 시간 [s]": f"{res.runtime_s:.2f}",
+                f"CD (M={M_single:.2f})": f"{res.coeffs['CD_total']:.4f}",
+                f"CN (M={M_single:.2f})": f"{res.coeffs['CN']:.4f}",
+                f"Cm (M={M_single:.2f})": f"{res.coeffs['Cm']:.4f}",
+            }
+        )
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    tabs = st.tabs(["📐 형상 프로파일", "📈 CD vs Mach", "🌈 유동장 분포", "🔵 항력 성분 분해", "🔄 안정성 계수", "📉 잔차"])
+
+    with tabs[0]:
+        st.markdown("비교 레이어 토글")
+        toggle_cols = st.columns(max(1, len(selected_meshes)))
+        visible_meshes = {}
+        visible_cases = {}
+        for idx, name in enumerate(selected_meshes.keys()):
+            checked = toggle_cols[idx].checkbox(name, value=True, key=f"profile_visible_{name}")
+            if checked:
+                visible_meshes[name] = selected_meshes[name]
+                visible_cases[name] = selected_cases[name]
+
+        if visible_meshes:
+            st.plotly_chart(plot_rocket_profile(visible_meshes, visible_cases), use_container_width=True)
+        else:
+            st.info("표시할 형상을 하나 이상 선택해주세요.")
+        st.caption("▲ 체크를 끄면 해당 형상 레이어가 사라지고, 다시 켜면 나타납니다.")
+
+        if selected_meshes:
+            st.markdown("개별 형상 보기")
+            shape_tabs = st.tabs(list(selected_meshes.keys()))
+            for idx, name in enumerate(selected_meshes.keys()):
+                with shape_tabs[idx]:
+                    mesh = selected_meshes[name]
+                    st.plotly_chart(
+                        plot_single_profile(mesh, selected_cases[name].color, f"{name} | 개별 프로파일"),
+                        use_container_width=True,
+                    )
+                    st.caption(
+                        f"mesh file: `{Path(selected_cases[name].path).name}` | L={mesh.length_ref:.3f} m | Rmax={mesh.r_ref:.3f} m"
+                    )
+
+    with tabs[1]:
+        fig_cd = plot_cd_vs_mach(mach_arr, sweep_results, selected_cases)
+        st.plotly_chart(fig_cd, use_container_width=True)
+        df_cd = pd.DataFrame({"Mach": mach_arr})
+        for name, data in sweep_results.items():
+            df_cd[f"{name}_CD"] = data["cd"]
+        st.download_button("📥 CD 데이터 CSV 다운로드", df_cd.to_csv(index=False).encode(), "cd_vs_mach.csv", "text/csv")
+
+    with tabs[2]:
+        if selected_meshes:
+            var_map = {"압력 P": "P", "밀도 ρ": "rho", "온도 T": "T", "마하수 M": "Mach", "압력계수 Cp": "Cp"}
+            flow_tabs = st.tabs(list(selected_meshes.keys()))
+            for idx, name in enumerate(selected_meshes.keys()):
+                with flow_tabs[idx]:
+                    flow_mesh = selected_meshes[name]
+                    flow_res = single_results[name]
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.pyplot(
+                            plot_flowfield(flow_mesh, flow_res, var_map[flow_field_var], selected_cases[name].color, M_single, region="full"),
+                            use_container_width=True,
+                        )
+                    with c2:
+                        st.pyplot(
+                            plot_flowfield(flow_mesh, flow_res, var_map[flow_field_var], selected_cases[name].color, M_single, region="quad"),
+                            use_container_width=True,
+                        )
+                    st.pyplot(
+                        plot_flowfield(flow_mesh, flow_res, var_map[flow_field_var], selected_cases[name].color, M_single, region="boattail"),
+                        use_container_width=True,
+                    )
+                    st.caption(
+                        f"▲ {name} 유동장입니다. 좌: 전체장, 우: 형상 근처 quad layer, 아래: boattail 확대."
+                    )
+
+    with tabs[3]:
+        cols = st.columns(min(3, len(selected_meshes)))
+        for i, name in enumerate(selected_meshes):
+            with cols[i % len(cols)]:
+                st.plotly_chart(plot_cd_breakdown(single_results[name], f"{name} | CD 분해"), use_container_width=True)
+
+    with tabs[4]:
+        st.plotly_chart(plot_cn_cm_vs_mach(mach_arr, sweep_results, selected_cases), use_container_width=True)
+        st.caption("▲ 축대칭 해석 한계를 고려해 CN/Cm은 CFD 축력과 slender-body proxy를 결합한 지표입니다.")
+
+    with tabs[5]:
+        cols = st.columns(min(3, len(selected_meshes)))
+        for i, name in enumerate(selected_meshes):
+            with cols[i % len(cols)]:
+                st.plotly_chart(plot_residual_history(single_results[name], f"{name} | LU-SGS Residual"), use_container_width=True)
+
+
+def main():
+    st.markdown(
+        """
+        <div style='border: 1px solid #1A3A5A; border-radius: 8px; padding: 18px 24px;
+                    background: linear-gradient(135deg, #050D1A, #0A1930); margin-bottom: 20px;'>
+            <div style='font-family:"Share Tech Mono",monospace; font-size:22px;
+                        color:#4FC3F7; letter-spacing:4px;'>
+                🚀 발사체 CFD 시뮬레이터
+            </div>
+            <div style='font-family:"Rajdhani",sans-serif; font-size:14px;
+                        color:#7AB3CC; margin-top:6px; letter-spacing:1px;'>
+                1.mesh NPZ · Compressible RANS · k-ω SST · AUSM+ · LU-SGS
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    workdir = Path(__file__).resolve().parent
+    mesh_cases = discover_mesh_cases(workdir)
+
+    available_names = list(mesh_cases.keys())
+    default_sel = [n for n in ["누리호 (KSLV-II)", "타우러스 2210", "팰컨 9 (Block 5)"] if n in mesh_cases]
+
+    with st.sidebar:
+        with st.form("solver_controls"):
+            st.markdown('<div class="section-header">📐 해석 조건</div>', unsafe_allow_html=True)
+            altitude = st.slider("고도 [m]", 0, 80000, 10000, 1000)
+            M_single = st.slider("단일 마하수 (유동장/계수 조회)", 0.3, 5.0, 2.0, 0.1)
+            n_mach = st.slider("마하 스윕 포인트 수", 3, 20, 6, 1)
+            max_iter = st.slider("LU-SGS 반복 수", 4, 40, 12, 2)
+            cfl = st.slider("LU-SGS CFL", 0.5, 8.0, 2.5, 0.5)
+
+            st.markdown('<div class="section-header">🛸 분석 발사체 선택</div>', unsafe_allow_html=True)
+            sel_rockets = st.multiselect("비교할 발사체", ["누리호 (KSLV-II)", "타우러스 2210", "팰컨 9 (Block 5)"], default=default_sel)
+
+            st.markdown('<div class="section-header">🧩 메쉬 입력</div>', unsafe_allow_html=True)
+            if not mesh_cases:
+                st.error("1.mesh.py가 생성한 NPZ 메쉬를 찾지 못했습니다.")
+            else:
+                for name in ["누리호 (KSLV-II)", "타우러스 2210", "팰컨 9 (Block 5)"]:
+                    if name in mesh_cases:
+                        st.caption(f"{name}: `{Path(mesh_cases[name].path).name}`")
+
+            st.markdown('<div class="section-header">🎨 시각화 설정</div>', unsafe_allow_html=True)
+            flow_field_var = st.selectbox("유동장 시각화 변수", ["압력 P", "밀도 ρ", "온도 T", "마하수 M", "압력계수 Cp"])
+            flow_rocket_name = st.selectbox("유동장 표시 발사체", available_names if available_names else ["없음"])
+            run_btn = st.form_submit_button("▶ 시뮬레이션 실행", type="primary")
+
+    if "last_run_bundle" not in st.session_state:
+        st.session_state["last_run_bundle"] = None
+
+    if not run_btn and st.session_state["last_run_bundle"] is None:
+        st.markdown(
+            """
+            <div class="warning-box">
+            ⓘ  현재 앱은 1.mesh.py가 만든 NPZ 메쉬를 읽어 CFD 계산을 수행합니다.<br>
+            &nbsp;&nbsp;&nbsp;&nbsp;왼쪽 파라미터를 바꿔도 <strong>시뮬레이션 실행</strong> 전까지는 계산이 다시 시작되지 않습니다.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+
+    if not mesh_cases:
+        st.stop()
+    if not sel_rockets:
+        st.error("발사체를 최소 1개 선택해주세요.")
+        return
+
+    if run_btn:
+        selected_cases = {name: mesh_cases[name] for name in sel_rockets if name in mesh_cases}
+        selected_meshes = {name: load_mesh(case.path, name) for name, case in selected_cases.items()}
+        atm_cond = isa_atmosphere(altitude)
+        mach_arr = np.linspace(max(0.3, min(0.8, M_single)), 5.0, n_mach)
+        est_runtime_s = estimate_runtime_seconds(
+            max(len(mesh.cell_nodes) for mesh in selected_meshes.values()),
+            max_iter,
+            n_mach,
+            len(selected_meshes),
+        )
+
+        progress_bar = st.progress(0.0, text="계산 준비 중...")
+        log_placeholder = st.empty()
+        logs: List[str] = []
+
+        def push_log(message: str):
+            logs.append(message)
+            log_placeholder.code("\n".join(logs[-12:]), language="text")
+
+        st.markdown('<div class="section-header">📊 수치 해석 진행 로그</div>', unsafe_allow_html=True)
+        push_log(f"예상 총 계산 시간: 약 {est_runtime_s/60:.1f}분 ({est_runtime_s:.0f}초)")
+
+        base_cfg = SolverConfig(mach=M_single, altitude=altitude, cfl=cfl, max_iter=max_iter)
+        single_results: Dict[str, SolverResult] = {}
+        sweep_results: Dict[str, Dict[str, List[float]]] = {}
+        total_units = len(selected_meshes) * max(max_iter + n_mach, 1)
+        finished_units = 0
+
+        for name, mesh in selected_meshes.items():
+            push_log(f"[{name}] 단일 마하 해석 시작 | cells={len(mesh.cell_nodes):,} faces={len(mesh.faces_left):,}")
+
+            def single_cb(message: str, frac: float, _name=name):
+                overall = (finished_units + frac * max_iter) / total_units
+                progress_bar.progress(min(overall, 1.0), text=message)
+                push_log(message)
+
+            single_results[name] = solve_case(mesh, base_cfg, progress_callback=single_cb)
+            finished_units += max_iter
+            push_log(f"[{name}] 단일 마하 해석 완료 | time={single_results[name].runtime_s:.2f}s")
+
+            def sweep_cb(message: str, frac: float, _name=name):
+                overall = (finished_units + frac * n_mach) / total_units
+                progress_bar.progress(min(overall, 1.0), text=message)
+                push_log(message)
+
+            sweep_results[name] = run_mach_sweep(mesh, mach_arr, altitude, base_cfg, progress_callback=sweep_cb)
+            finished_units += n_mach
+            push_log(f"[{name}] 마하 스윕 완료")
+
+        progress_bar.progress(1.0, text="계산 완료")
+        push_log("모든 케이스 계산이 완료되었습니다.")
+
+        st.session_state["last_run_bundle"] = {
+            "atm_cond": atm_cond,
+            "mach_arr": mach_arr,
+            "selected_cases": selected_cases,
+            "selected_meshes": selected_meshes,
+            "single_results": single_results,
+            "sweep_results": sweep_results,
+            "M_single": M_single,
+            "altitude": altitude,
+            "estimated_runtime_s": est_runtime_s,
+        }
+
+    bundle = st.session_state["last_run_bundle"]
+    if bundle is not None:
+        render_results_bundle(bundle, flow_field_var, flow_rocket_name)
+
+    with st.expander("📖 적용 수치기법 요약"):
+        st.markdown(
+            """
+            - 지배 방정식: cell-centered finite-volume compressible RANS
+            - 난류 모델: k-ω SST blended constants, eddy viscosity closure
+            - 대류 플럭스: AUSM+ mass/pressure splitting
+            - 점성항: Green-Gauss gradient + central viscous flux
+            - 시간적분: local pseudo-time LU-SGS
+            - 메쉬 입력: 1.mesh.py 생성 NPZ (`nodes`, `quad_cells`, `tri_cells`, `face_nodes`, `face_tag`)
+            """
+        )
+
+
+if __name__ == "__main__":
+    main()
