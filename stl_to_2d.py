@@ -319,40 +319,6 @@ def do_flip(x_arr, r_arr):
     x_arr = x_arr - x_arr.min()
     return x_arr, r_arr
 
-# =============================================================================
-# 5-b. Cap nose and tail endpoints with r=0
-# =============================================================================
-
-def cap_endpoints(x_arr, r_arr):
-    """
-    Close the nose and tail of the profile by inserting r=0 cap points.
-
-    Without caps the profile is open at both ends:
-      Nose: x=0,  r=r_nose (small but nonzero)
-      Tail: x=L,  r=r_tail (can be large if engine base is cut)
-
-    This inserts:
-      (x_nose, 0) at the front  -> symmetry axis intersection at nose
-      (x_tail, 0) at the back   -> symmetry axis intersection at tail
-
-    Effect on mesh.py:
-      The profile now starts and ends at r=0, so inflation layers
-      have a properly closed boundary and cannot penetrate the body.
-    """
-    x_nose, r_nose = x_arr[0],  r_arr[0]
-    x_tail, r_tail = x_arr[-1], r_arr[-1]
-
-    print(f"[Cap] Nose: x={x_nose:.5f} r={r_nose:.5f} -> prepending (x={x_nose:.5f}, r=0)")
-    print(f"[Cap] Tail: x={x_tail:.5f} r={r_tail:.5f} -> appending  (x={x_tail:.5f}, r=0)")
-
-    x_cap = np.concatenate([[x_nose], x_arr, [x_tail]])
-    r_cap = np.concatenate([[0.0],    r_arr, [0.0   ]])
-
-    print(f"[Cap] Profile: {len(x_arr)} pts -> {len(x_cap)} pts (with caps)")
-    return x_cap, r_cap
-
-
-
 
 # =============================================================================
 # 6. Plot
@@ -507,13 +473,10 @@ def main():
     # 5. User confirmation
     x_arr, r_arr = confirm(x_arr, r_arr)
 
-    # 6. Cap nose and tail (insert r=0 at both ends)
-    x_arr, r_arr = cap_endpoints(x_arr, r_arr)
-
-    # 7. Save final plot + CSV
+    # 6. Save plot + CSV
     plot_profile(
         x_arr, r_arr,
-        title=f"Confirmed (capped): {os.path.basename(args.stl)}",
+        title=f"Confirmed: {os.path.basename(args.stl)}",
         save_path=outpng, show=False
     )
     save_csv(x_arr, r_arr, outcsv)
